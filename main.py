@@ -4,20 +4,18 @@ import os
 
 app = FastAPI()
 
-# 🔐 Variables de entorno (Railway)
+# Variables de entorno (Railway)
 ODOO_URL = os.getenv("ODOO_URL")
 ODOO_DB = os.getenv("ODOO_DB")
 ODOO_USER = os.getenv("ODOO_USER")
 ODOO_PASSWORD = os.getenv("ODOO_PASSWORD")
 
 
-# 🌐 Endpoint raíz: prueba de conexión
 @app.get("/")
 def root():
     return {"status": "✅ API funcionando correctamente 💫"}
 
 
-# 📦 Endpoint: inventario con variantes y atributos
 @app.get("/inventario")
 def get_inventario(limit: int = Query(5, description="Número de productos a devolver")):
     try:
@@ -30,7 +28,7 @@ def get_inventario(limit: int = Query(5, description="Número de productos a dev
 
         models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
 
-        # 🔍 Leer productos activos con atributos
+        # --- Obtener variantes (product.product)
         productos = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD,
             'product.product', 'search_read',
@@ -38,27 +36,26 @@ def get_inventario(limit: int = Query(5, description="Número de productos a dev
             {
                 'fields': [
                     'id', 'name', 'default_code', 'qty_available',
-                    'list_price', 'product_tmpl_id', 'categ_id',
-                    'barcode', 'attribute_value_ids'   # ← añadimos atributos
+                    'list_price', 'product_tmpl_id', 'categ_id', 'barcode'
                 ],
                 'limit': limit
             }
         )
 
-        # 🧩 Normalización de datos
+        # --- Normalizar datos y agregar atributos de plantilla
         def normalize(p):
             atributos = []
-            if p.get('attribute_value_ids'):
-                try:
-                    # Obtener nombres de los atributos por ID
-                    atributos_raw = models.execute_kw(
-                        ODOO_DB, uid, ODOO_PASSWORD,
-                        'product.attribute.value', 'read',
-                        [p['attribute_value_ids']], {'fields': ['name']}
-                    )
-                    atributos = [a['name'] for a in atributos_raw]
-                except Exception:
-                    atributos = []
+            try:
+                # Buscar valores de atributo desde product.template.attribute.value
+                valores = models.execute_kw(
+                    ODOO_DB, uid, ODOO_PASSWORD,
+                    'product.template.attribute.value', 'search_read',
+                    [[['product_tmpl_id', '=', p['product_tmpl_id'][0]]]],
+                    {'fields': ['name']}
+                )
+                atributos = [v['name'] for v in valores]
+            except Exception:
+                atributos = []
 
             return {
                 "id": p["id"],
@@ -72,7 +69,6 @@ def get_inventario(limit: int = Query(5, description="Número de productos a dev
                 "barcode": p.get("barcode")
             }
 
-        # ✅ Respuesta final
         return {"productos": [normalize(p) for p in productos]}
 
     except Exception as e:
