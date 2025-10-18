@@ -37,7 +37,7 @@ def get_inventario(
         if category:
             domain.append(['categ_id.name', 'ilike', category])
 
-        # --- Leer productos (variantes) ---
+        # --- Leer productos ---
         productos = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD,
             'product.product', 'search_read',
@@ -51,11 +51,9 @@ def get_inventario(
             }
         )
 
-        # --- Normalizar productos ---
         def normalize(p):
             atributos = defaultdict(list)
             try:
-                # Obtener valores de atributo de la plantilla asociada
                 valores = models.execute_kw(
                     ODOO_DB, uid, ODOO_PASSWORD,
                     'product.template.attribute.value', 'search_read',
@@ -65,7 +63,7 @@ def get_inventario(
 
                 for v in valores:
                     if v.get('attribute_id'):
-                        tipo = v['attribute_id'][1]  # Ej: "Color", "Talla"
+                        tipo = v['attribute_id'][1]
                         atributos[tipo].append(v['name'])
 
             except Exception as e:
@@ -83,7 +81,19 @@ def get_inventario(
                 "barcode": p.get("barcode")
             }
 
-        return {"productos": [normalize(p) for p in productos]}
+        # --- Normalizar y generar texto ---
+        productos_norm = [normalize(p) for p in productos]
+
+        if productos_norm:
+            mensaje = "\n\n".join([
+                f"⭐ *{p['name']}*\n💰 Precio: ${p['price']}\n📦 Stock: {int(p['stock'])}"
+                for p in productos_norm
+            ])
+            texto = f"🌿 Catálogo para {category.upper() if category else 'TODAS LAS ESCUELAS'} 🎒\n\n{mensaje}"
+        else:
+            texto = f"No se encontraron productos para la categoría: {category or 'sin categoría'}."
+
+        return {"mensaje": texto}
 
     except Exception as e:
         return {"error": f"Ocurrió un error: {str(e)}"}
