@@ -27,16 +27,38 @@ def get_inventario(limit: int = Query(5, description="Número de productos a dev
             return {"error": "❌ Error de autenticación con Odoo. Verifica tus credenciales."}
 
         models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
+# dentro de /inventario
+productos = models.execute_kw(
+    ODOO_DB, uid, ODOO_PASSWORD,
+    'product.product', 'search_read',
+    [[['active', '=', True]]],
+    {
+        'fields': [
+            'id', 'name', 'default_code',   # SKU
+            'qty_available', 'list_price',
+            'product_tmpl_id',              # [id, nombre plantilla]
+            'categ_id',                     # [id, nombre categoría] (viene desde la plantilla)
+            'barcode'
+        ],
+        'limit': limit
+    }
+)
 
-        # Buscar productos activos
-        productos = models.execute_kw(
-            ODOO_DB, uid, ODOO_PASSWORD,
-            'product.product', 'search_read',
-            [[['active', '=', True]]],
-            {'fields': ['id', 'name', 'qty_available', 'list_price'], 'limit': limit}
-        )
+# Opcional: “limpiar” la salida para hacerla más legible
+def normalize(p):
+    return {
+        "id": p["id"],
+        "name": p["name"],
+        "sku": p.get("default_code"),
+        "price": p.get("list_price"),
+        "stock": p.get("qty_available"),
+        "template": p["product_tmpl_id"][1] if p.get("product_tmpl_id") else None,
+        "category": p["categ_id"][1] if p.get("categ_id") else None,
+        "barcode": p.get("barcode")
+    }
 
-        return {"productos": productos}
+return {"productos": [normalize(p) for p in productos]}
+
 
     except Exception as e:
         return {"error": f"Ocurrió un error: {str(e)}"}
