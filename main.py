@@ -272,7 +272,6 @@ async def register_interaction(request: Request):
         fecha_norm   = normalize_datetime(data.get("fecha"))
         telefono     = (data.get("telefono") or "").strip()
         correo       = (data.get("correo") or "").strip()
-        nombre       = (data.get("nombre") or "").strip()
 
         if not messenger_id:
             return {"status": "error", "message": "Falta messenger_id"}
