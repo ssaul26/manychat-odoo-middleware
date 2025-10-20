@@ -139,3 +139,47 @@ def get_inventario(
 
     except Exception as e:
         return {"catalogo_msg": f"⚠️ Hubo un error obteniendo el catálogo.\n\nDetalle: {str(e)}", "next_offset": 0}
+
+@app.get("/faq")
+def get_faq(
+    format: str = Query("text", regex="^(json|text)$", description="json (default) o text")
+):
+    """
+    Devuelve todas las preguntas frecuentes del módulo Knowledge (sin filtrar por escuela).
+    """
+    try:
+        common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
+        uid = common.authenticate(ODOO_DB, ODOO_USER, ODOO_PASSWORD, {})
+        if not uid:
+            return {"error": "❌ Error de autenticación con Odoo."}
+
+        models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
+
+        # Leer los artículos activos de Knowledge
+        articulos = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD,
+            'knowledge.article', 'search_read',
+            [[['active', '=', True]]],
+            {'fields': ['name', 'body'], 'limit': 10, 'order': 'create_date asc'}
+        )
+
+        if not articulos:
+            return {"faq_msg": "No se encontraron preguntas frecuentes.", "total": 0}
+
+        # Construir texto para ManyChat
+        bloques = []
+        for art in articulos:
+            nombre = art.get('name', 'Artículo sin nombre')
+            cuerpo = art.get('body', '').replace("<p>", "").replace("</p>", "")
+            bloques.append(f"⭐ *{nombre}*\n\n{cuerpo}")
+
+        msg = "\n\n".join(bloques)
+
+        if format == "json":
+            return {"articulos": articulos, "total": len(articulos)}
+        else:
+            return {"faq_msg": msg, "total": len(articulos)}
+
+    except Exception as e:
+        return {"error": f"⚠️ Ocurrió un error: {str(e)}"}
+
