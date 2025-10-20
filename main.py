@@ -186,7 +186,7 @@ def get_faq(category: str = None, format: str = "text"):
             # Formato tipo “sección elegante” para ManyChat
             bloque = (
                 f"📘 *{name}*\n\n"
-                f"{clean_body}\n"
+                f"{clean_body}\n\n"
                 f"━━━━━━━━━━━━━━━"
             )
             mensajes.append(bloque)
