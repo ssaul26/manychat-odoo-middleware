@@ -325,7 +325,7 @@ async def register_interaction(request: Request):
             # create
             rec_id = models.execute_kw(
                 ODOO_DB, uid, ODOO_PASSWORD,
-                "x_interacciones_chatbot", "create",
+                "x_interacciones_chatbo", "create",
                 [vals]
             )
             action = "created"
