@@ -212,24 +212,38 @@ def get_faq(category: str = None, format: str = "text"):
 
 def normalize_datetime(s: str | None) -> str:
     """
-    Convierte cualquier fecha entrante a 'YYYY-MM-DD HH:MM:SS' (sin microsegundos).
-    Si no viene fecha, usa UTC ahora.
+    Devuelve 'YYYY-MM-DD HH:MM:SS' (sin microsegundos) para lo que llegue de ManyChat.
     """
     if not s:
         return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-    # Intentamos varios formatos comunes
-    try:
-        # ISO con o sin microsegundos / con 'T'
-        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-    except Exception:
+
+    # Intenta varios formatos comunes
+    candidates = [
+        # ISO con o sin microsegundos y con 'T' o 'Z'
+        (lambda x: datetime.fromisoformat(x.replace("Z", "+00:00"))),
+        # ManyChat (ej: '20 Oct 2025, 05:41pm')
+        (lambda x: datetime.strptime(x, "%d %b %Y, %I:%M%p")),
+        # Variante con mes completo por si acaso ('October')
+        (lambda x: datetime.strptime(x, "%d %B %Y, %I:%M%p")),
+        # Clásico 'YYYY-MM-DD HH:MM:SS'
+        (lambda x: datetime.strptime(x, "%Y-%m-%d %H:%M:%S")),
+        # ISO sin zona pero con microsegundos
+        (lambda x: datetime.strptime(x, "%Y-%m-%dT%H:%M:%S.%f")),
+        # ISO sin microsegundos
+        (lambda x: datetime.strptime(x, "%Y-%m-%dT%H:%M:%S")),
+    ]
+
+    for parser in candidates:
         try:
-            # ManyChat suele mandar 'YYYY-MM-DD HH:MM:SS'
-            dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+            dt = parser(s)
+            # Si nos dieron un aware con tzinfo, puedes convertir a UTC si quieres.
+            # Para Odoo basta con quitar microsegundos y devolver string simple:
+            return dt.strftime("%Y-%m-%d %H:%M:%S")
         except Exception:
-            # Respaldo: ahora en UTC
-            dt = datetime.utcnow()
-    # Devolver sin microsegundos
-    return dt.strftime("%Y-%m-%d %H:%M:%S")
+            continue
+
+    # Si nada funcionó, usa ahora UTC como respaldo
+    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
 @app.post("/register_interaction")
 async def register_interaction(request: Request):
