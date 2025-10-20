@@ -141,14 +141,16 @@ def get_inventario(
         return {"catalogo_msg": f"⚠️ Hubo un error obteniendo el catálogo.\n\nDetalle: {str(e)}", "next_offset": 0}
 
 @app.get("/faq")
-def get_faq(format: str = "text"):
+def get_faq(
+    category: str = Query(None, description="Filtra por categoría (opcional)"),
+    format: str = Query("text", regex="^(json|text)$", description="Formato de salida: json o text")
+):
     """
-    Devuelve el artículo de Preguntas Frecuentes en formato limpio para ManyChat.
+    Devuelve los artículos de Preguntas Frecuentes.
+    Si se especifica 'category', filtra por ese nombre parcial (ilike).
     """
-    import re, html
-
     try:
-        # --- Autenticación ---
+        # Autenticación con Odoo
         common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
         uid = common.authenticate(ODOO_DB, ODOO_USER, ODOO_PASSWORD, {})
         if not uid:
@@ -156,38 +158,39 @@ def get_faq(format: str = "text"):
 
         models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
 
-        # --- Buscar el artículo de FAQ ---
+        # --- Dominio dinámico ---
+        domain = []
+        if category:
+            domain.append(["name", "ilike", category])
+        else:
+            domain.append(["name", "ilike", ""])
+
+        # --- Buscar artículos ---
         faq_records = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD,
             "knowledge.article", "search_read",
-            [[("name", "ilike", "Preguntas Frecuentes")]],
-            {"fields": ["name", "body"], "limit": 1}
+            [domain],
+            {"fields": ["name", "body"], "limit": 10, "order": "name asc"}
         )
 
         if not faq_records:
-            return {"faq_msg": "⚠️ No se encontraron Preguntas Frecuentes."}
+            return {"faq_msg": f"⚠️ No se encontraron preguntas para '{category}'."}
 
+        # --- Procesamiento y limpieza ---
+        import re, html
         mensajes = []
-        total = 0
-
         for record in faq_records:
-            name = record.get("name", "Preguntas Frecuentes")
-            body = str(record.get("body", ""))
-
-            # --- Limpieza del HTML ---
-            clean_body = html.unescape(body)
-            clean_body = re.sub(r"<[^>]*>", "", clean_body)
-            clean_body = clean_body.replace("\xa0", " ")
+            name = record.get("name", "")
+            body = html.unescape(record.get("body", ""))
+            clean_body = re.sub(r"<[^>]*>", "", body)  # eliminar etiquetas HTML
             clean_body = re.sub(r"\n{3,}", "\n\n", clean_body).strip()
+            mensajes.append(f"📘 *{name}*\n\n{clean_body}")
 
-            mensajes.append(f"💬 *{name}*\n\n{clean_body}")
-            total += 1
+        faq_msg = "\n\n────────────────────\n\n".join(mensajes)
 
-        faq_msg = "\n\n".join(mensajes)
-
-        return {"faq_msg": faq_msg, "total": total}
+        if format == "json":
+            return {"faq": faq_records}
+        return {"faq_msg": faq_msg, "total": len(faq_records)}
 
     except Exception as e:
         return {"faq_msg": f"⚠️ Error al procesar las FAQ: {str(e)}"}
-
-
