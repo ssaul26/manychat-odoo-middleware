@@ -2,7 +2,6 @@ from fastapi import FastAPI, Query
 import xmlrpc.client
 import os
 from collections import defaultdict, OrderedDict
-from bs4 import BeautifulSoup  # para limpiar HTML
 
 app = FastAPI()
 
