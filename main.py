@@ -245,7 +245,7 @@ async def register_interaction(request: Request):
             "create",
             [
                 {
-                    "x_studio_messenger_id": messenger_id,
+                    "x_studio_messeger_id": messenger_id,
                     "x_studio_channel": canal,
                     "x_studio_event": evento,
                     "x_studio_timestamp": fecha,
