@@ -141,16 +141,13 @@ def get_inventario(
         return {"catalogo_msg": f"⚠️ Hubo un error obteniendo el catálogo.\n\nDetalle: {str(e)}", "next_offset": 0}
 
 @app.get("/faq")
-def get_faq(
-    category: str = Query(None, description="Filtra por categoría (opcional)"),
-    format: str = Query("text", regex="^(json|text)$", description="Formato de salida: json o text")
-):
+def get_faq(category: str = None, format: str = "text"):
     """
-    Devuelve los artículos de Preguntas Frecuentes.
-    Si se especifica 'category', filtra por ese nombre parcial (ilike).
+    Devuelve las preguntas frecuentes en formato limpio y con estilo para ManyChat.
+    Si se pasa ?category=Nombre, filtra por esa categoría.
     """
     try:
-        # Autenticación con Odoo
+        # Autenticación
         common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
         uid = common.authenticate(ODOO_DB, ODOO_USER, ODOO_PASSWORD, {})
         if not uid:
@@ -158,39 +155,44 @@ def get_faq(
 
         models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
 
-        # --- Dominio dinámico ---
+        # Dominio de búsqueda (por categoría)
         domain = []
         if category:
             domain.append(["name", "ilike", category])
-        else:
-            domain.append(["name", "ilike", ""])
 
-        # --- Buscar artículos ---
+        # Obtener artículos
         faq_records = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD,
             "knowledge.article", "search_read",
             [domain],
-            {"fields": ["name", "body"], "limit": 10, "order": "name asc"}
+            ["name", "body"]
         )
 
         if not faq_records:
-            return {"faq_msg": f"⚠️ No se encontraron preguntas para '{category}'."}
+            return {"faq_msg": f"⚠️ No se encontraron artículos para la categoría '{category}'."}
 
-        # --- Procesamiento y limpieza ---
         import re, html
         mensajes = []
+
         for record in faq_records:
-            name = record.get("name", "")
-            body = html.unescape(record.get("body", ""))
-            clean_body = re.sub(r"<[^>]*>", "", body)  # eliminar etiquetas HTML
-            clean_body = re.sub(r"\n{3,}", "\n\n", clean_body).strip()
-            mensajes.append(f"📘 *{name}*\n\n{clean_body}")
+            name = record["name"]
+            body = str(record.get("body", ""))
 
-        faq_msg = "\n\n────────────────────\n\n".join(mensajes)
+            # Limpieza básica de HTML
+            clean_body = html.unescape(body)
+            clean_body = re.sub(r"<[^>]+>", "", clean_body)
+            clean_body = clean_body.replace("\xa0", " ").strip()
 
-        if format == "json":
-            return {"faq": faq_records}
-        return {"faq_msg": faq_msg, "total": len(faq_records)}
+            # Formato tipo “sección elegante” para ManyChat
+            bloque = (
+                f"📘 *{name}*\n\n"
+                f"{clean_body}\n"
+                f"━━━━━━━━━━━━━━━"
+            )
+            mensajes.append(bloque)
+
+        faq_msg = "\n\n".join(mensajes)
+        return {"faq_msg": faq_msg, "total": len(mensajes)}
 
     except Exception as e:
         return {"faq_msg": f"⚠️ Error al procesar las FAQ: {str(e)}"}
