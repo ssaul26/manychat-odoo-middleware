@@ -212,23 +212,17 @@ def get_faq(category: str = None, format: str = "text"):
 
 @app.post("/register_interaction")
 async def register_interaction(request: Request):
-    """
-    Recibe datos desde ManyChat y los guarda en el modelo "Interacciones Chatbot" de Odoo.
-    """
     try:
-        # 🟢 1. Leer datos JSON del cuerpo de la solicitud
         data = await request.json()
 
         messenger_id = data.get("messenger_id")
-        canal = data.get("canal")
-        evento = data.get("evento")
-        fecha = data.get("fecha") or datetime.utcnow().isoformat()
+        canal        = data.get("canal")
+        evento       = data.get("evento")
+        fecha        = data.get("fecha") or datetime.utcnow().isoformat()
 
-        # Validación básica
         if not messenger_id:
             return {"status": "error", "message": "Falta messenger_id"}
 
-        # 🟢 2. Autenticación
         common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
         uid = common.authenticate(ODOO_DB, ODOO_USER, ODOO_PASSWORD, {})
         if not uid:
@@ -236,25 +230,23 @@ async def register_interaction(request: Request):
 
         models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
 
-        # 🟢 3. Crear registro en el modelo de Studio
+        # Ajusta estos nombres a los técnicos reales de tus campos en Studio
+        vals = {
+            "x_name": f"{canal or 'Canal'} - {evento or 'Interacción'} - {messenger_id}",  # <-- Descripción obligatoria
+            "x_studio_messeger_id": messenger_id,   # o x_studio_messenger_id si así está en tu Studio
+            "x_studio_channel":     canal,
+            "x_studio_event":       evento,
+            "x_studio_timestamp":   fecha,
+        }
+
         record_id = models.execute_kw(
-            ODOO_DB,
-            uid,
-            ODOO_PASSWORD,
-            "x_interacciones_chatbo",  # nombre técnico del modelo
+            ODOO_DB, uid, ODOO_PASSWORD,
+            "x_interacciones_chatbot",   # <-- con 't'
             "create",
-            [
-                {
-                    "x_studio_messeger_id": messenger_id,
-                    "x_studio_channel": canal,
-                    "x_studio_event": evento,
-                    "x_studio_timestamp": fecha,
-                }
-            ],
+            [vals]
         )
 
         return {"status": "success", "record_id": record_id}
 
     except Exception as e:
-        # 🔴 Log de error con más claridad
         return {"status": "error", "message": f"Error al registrar interacción: {str(e)}"}
