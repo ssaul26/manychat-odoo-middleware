@@ -221,7 +221,7 @@ def get_faq(category: str = None, format: str = "text"):
 
             contenido = format_article(body)
             bloque = f"📘 *{name}*\n\n{contenido}\n────────────────"
-            bloques.append(bloque)
+            bloques.append("\n\n" + bloque)
 
         faq_msg = "\n\n".join(bloques).strip()
         return {"faq_msg": faq_msg, "total": len(bloques)}
