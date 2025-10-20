@@ -153,7 +153,7 @@ def get_faq(category: str = None, format: str = "text"):
     from bs4 import BeautifulSoup
 
     try:
-        # Autenticación
+        # --- Autenticación con Odoo ---
         common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
         uid = common.authenticate(ODOO_DB, ODOO_USER, ODOO_PASSWORD, {})
         if not uid:
@@ -161,12 +161,12 @@ def get_faq(category: str = None, format: str = "text"):
 
         models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
 
-        # Dominio (filtra por categoría si la envías)
+        # --- Dominio de búsqueda ---
         domain = []
         if category:
             domain.append(["name", "ilike", category])
 
-        # Traer artículos
+        # --- Consulta de artículos ---
         faq_records = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD,
             "knowledge.article", "search_read",
@@ -177,55 +177,52 @@ def get_faq(category: str = None, format: str = "text"):
         if not faq_records:
             return {"faq_msg": f"⚠️ No se encontraron artículos para '{category}'."}
 
+        # --- Limpieza y formateo del HTML ---
         def format_article(raw_html: str) -> str:
             soup = BeautifulSoup(raw_html or "", "html.parser")
             chunks = []
 
-            # Recorremos bloques que suelen aparecer en Knowledge
             for el in soup.find_all(["h2", "h3", "p", "ul", "ol", "br"]):
-                # Texto del nodo
                 txt = el.get_text(" ", strip=True)
                 if not txt and el.name != "br":
                     continue
 
                 if el.name in ("h2", "h3"):
-                    # Encabezados como sub-secciones (por si los usas)
                     chunks.append(f"\n📘 *{txt.upper()}*\n")
 
                 elif el.name == "p":
-                    # Si termina con ?, lo tratamos como “pregunta”
                     if txt.endswith("?"):
                         chunks.append(f"\n💬 *{txt}*")
                     else:
-                        chunks.append(txt)
+                        chunks.append(f"\n{txt}")
 
                 elif el.name in ("ul", "ol"):
                     items = [f"• {li.get_text(' ', strip=True)}"
                              for li in el.find_all("li")]
                     if items:
-                        chunks.append("\n".join(items))
+                        chunks.append("\n" + "\n".join(items))
 
                 elif el.name == "br":
-                    chunks.append("")  # sólo salto
+                    chunks.append("\n")
 
-            # Unimos y limpiamos saltos múltiples
-            text = "\n".join(chunks)
+            # Normalizar saltos de línea
+            text = "".join(chunks)
             text = html.unescape(text).replace("\xa0", " ")
             text = re.sub(r"\n{3,}", "\n\n", text).strip()
             return text
 
+        # --- Construcción de mensaje final ---
         bloques = []
         for rec in faq_records:
             name = rec.get("name", "Preguntas Frecuentes")
             body = rec.get("body", "")
 
             contenido = format_article(body)
-            bloque = f"📘 *{name}*\n\n{contenido}\n────────────────"
-            bloques.append("\n\n" + bloque)
+            bloque = f"\n\n📘 *{name}*\n\n{contenido}\n\n────────────────\n"
+            bloques.append(bloque)
 
         faq_msg = "\n\n".join(bloques).strip()
         return {"faq_msg": faq_msg, "total": len(bloques)}
 
     except Exception as e:
         return {"faq_msg": f"⚠️ Error al procesar las FAQ: {str(e)}"}
-
