@@ -2,6 +2,7 @@ from fastapi import FastAPI, Query
 import xmlrpc.client
 import os
 from collections import defaultdict, OrderedDict
+from bs4 import BeautifulSoup  # para limpiar HTML
 
 app = FastAPI()
 
@@ -141,66 +142,40 @@ def get_inventario(
         return {"catalogo_msg": f"⚠️ Hubo un error obteniendo el catálogo.\n\nDetalle: {str(e)}", "next_offset": 0}
 
 @app.get("/faq")
-def get_faq(format: str = Query("json", regex="^(json|text)$")):
+def get_faq(format: str = "json"):
     """
-    Devuelve las preguntas frecuentes del módulo 'Información' (Knowledge) de Odoo.
-    Está diseñado para mostrar UN artículo general (ej: 'Preguntas Frecuentes Sporthouse').
+    Endpoint para obtener las preguntas frecuentes desde Odoo
+    y devolverlas en texto limpio, formateadas para ManyChat.
     """
 
     try:
-        # 1️⃣ Autenticación
-        common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
-        uid = common.authenticate(ODOO_DB, ODOO_USER, ODOO_PASSWORD, {})
-        if not uid:
-            return {"faq_msg": "❌ Error de autenticación con Odoo."}
-
-        models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
-
-        # 2️⃣ Buscar artículo que contenga “Preguntas Frecuentes”
-        articulos = models.execute_kw(
-            ODOO_DB, uid, ODOO_PASSWORD,
-            'knowledge.article', 'search_read',
-            [[['active', '=', True], ['name', 'ilike', 'Preguntas Frecuentes']]],
-            {'fields': ['name', 'body'], 'limit': 1}
+        # --- 1️⃣ Leer artículos del módulo 'knowledge.article' ---
+        faq_records = API.env["knowledge.article"].search_read(
+            [("name", "ilike", "Preguntas Frecuentes")],
+            ["name", "body"]
         )
 
-        if not articulos:
-            return {"faq_msg": "⚠️ No se encontraron preguntas frecuentes."}
+        if not faq_records:
+            return {"error": "No se encontraron artículos FAQ"}
 
-        art = articulos[0]
-        nombre = art.get('name', 'Preguntas Frecuentes')
-        cuerpo = art.get('body') or ''
+        mensajes = []
+        total = 0
 
-        # 3️⃣ Convertir HTML a texto limpio
-        if not isinstance(cuerpo, str):
-            cuerpo = str(cuerpo)
+        # --- 2️⃣ Limpiar HTML y dar formato amigable ---
+        for record in faq_records:
+            soup = BeautifulSoup(record["body"], "html.parser")
+            clean_text = soup.get_text(separator="\n")
+            mensajes.append(f"💬 *{record['name']}*\n\n{clean_text.strip()}")
+            total += 1
 
-        reemplazos = {
-            "<p>": "",
-            "</p>": "\n",
-            "<br>": "\n",
-            "<br/>": "\n",
-            "&nbsp;": " ",
-            "<strong>": "*",
-            "</strong>": "*",
-            "<b>": "*",
-            "</b>": "*",
-            "<em>": "_",
-            "</em>": "_",
-        }
-        for k, v in reemplazos.items():
-            cuerpo = cuerpo.replace(k, v)
+        # --- 3️⃣ Concatenar todas las FAQ ---
+        faq_msg = "\n\n".join(mensajes)
 
-        cuerpo = cuerpo.strip()
-
-        # 4️⃣ Construcción del mensaje
-        faq_msg = f"💬 *{nombre}*\n\n{cuerpo}"
-
-        # 5️⃣ Salida según formato
-        if format == "json":
-            return {"faq_msg": faq_msg}
+        # --- 4️⃣ Devolver resultado según formato ---
+        if format == "text":
+            return {"faq_msg": faq_msg, "total": total}
         else:
-            return {"faq_msg": faq_msg}
+            return {"faq_msg": faq_msg, "total": total}
 
     except Exception as e:
-        return {"faq_msg": f"⚠️ Error obteniendo FAQ: {str(e)}"}
+        return {"error": f"⚠️ Ocurrió un error: {str(e)}"}
