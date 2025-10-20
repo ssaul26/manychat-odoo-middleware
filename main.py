@@ -141,6 +141,7 @@ def get_inventario(
     except Exception as e:
         return {"catalogo_msg": f"⚠️ Hubo un error obteniendo el catálogo.\n\nDetalle: {str(e)}", "next_offset": 0}
 
+
 @app.get("/faq")
 def get_faq(category: str = None, format: str = "text"):
     """
@@ -154,7 +155,7 @@ def get_faq(category: str = None, format: str = "text"):
     from bs4 import BeautifulSoup
 
     try:
-        # Autenticación
+        # --- Autenticación con Odoo ---
         common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
         uid = common.authenticate(ODOO_DB, ODOO_USER, ODOO_PASSWORD, {})
         if not uid:
@@ -162,12 +163,12 @@ def get_faq(category: str = None, format: str = "text"):
 
         models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
 
-        # Dominio (filtra por categoría si la envías)
+        # --- Dominio (filtra por categoría si se pasa el parámetro) ---
         domain = []
         if category:
             domain.append(["name", "ilike", category])
 
-        # Traer artículos
+        # --- Leer artículos desde Odoo ---
         faq_records = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD,
             "knowledge.article", "search_read",
@@ -178,70 +179,46 @@ def get_faq(category: str = None, format: str = "text"):
         if not faq_records:
             return {"faq_msg": f"⚠️ No se encontraron artículos para '{category}'."}
 
-        # 🛠️ FUNCIÓN CORREGIDA
+        # --- Función para limpiar y dar formato al HTML ---
         def format_article(raw_html: str) -> str:
             soup = BeautifulSoup(raw_html or "", "html.parser")
             chunks = []
 
-            # Recorremos bloques que suelen aparecer en Knowledge
-            for el in soup.find_all(["h2", "h3", "p", "ul", "ol", "li", "br"]):
-                # Texto del nodo
+            for el in soup.find_all(["h2", "h3", "p", "ul", "ol", "br"]):
                 txt = el.get_text(" ", strip=True)
-                
-                # Manejo de casos especiales para listas y vacíos
-                if el.name in ("li",) and not txt: 
-                    continue
                 if not txt and el.name != "br":
                     continue
-                
-                # Nota: Li's serán manejados por su padre ul/ol. 
-                # Si el.name == "li", ya lo procesaremos en ul/ol, 
-                # pero nos aseguramos de no procesar los li's por separado si ya tienen texto.
-                if el.name == "li" and el.parent and el.parent.name in ("ul", "ol"):
-                    continue 
 
                 if el.name in ("h2", "h3"):
-                    # Separación fuerte para títulos de sección
-                    chunks.append(f"\n\n📘 *{txt.upper()}*")
+                    chunks.append(f"\n📘 *{txt.upper()}*\n")
 
                 elif el.name == "p":
-                    # Si termina con ?, lo tratamos como “pregunta”
                     if txt.endswith("?"):
-                        # Asegurar un salto de línea ANTES de la pregunta
                         chunks.append(f"\n💬 *{txt}*")
                     else:
-                        # Para párrafos de respuesta, asegurar un salto DESPUÉS de la pregunta
-                        # o una separación de un párrafo anterior
-                        # El primer párrafo tendrá un salto, los siguientes dos saltos.
                         chunks.append(f"\n{txt}")
 
                 elif el.name in ("ul", "ol"):
                     items = [f"• {li.get_text(' ', strip=True)}"
-                             for li in el.find_all("li") if li.get_text(" ", strip=True)]
+                             for li in el.find_all("li")]
                     if items:
-                        # Asegurar un salto de línea antes de la lista
                         chunks.append("\n" + "\n".join(items))
 
                 elif el.name == "br":
-                    chunks.append("\n") # salto de línea explícito
+                    chunks.append("\n")
 
-            # Unimos y limpiamos saltos múltiples
-            # Unir con string vacío para tener control total de los \n
             text = "".join(chunks)
-
             text = html.unescape(text).replace("\xa0", " ")
-            # Limpiamos 3 o más saltos seguidos a solo 2 saltos.
             text = re.sub(r"\n{3,}", "\n\n", text).strip()
             return text
-        # 🛠️ FIN FUNCIÓN CORREGIDA
 
+        # --- Construir bloques de texto para ManyChat ---
         bloques = []
         for rec in faq_records:
             name = rec.get("name", "Preguntas Frecuentes")
             body = rec.get("body", "")
 
             contenido = format_article(body)
-            # Aseguramos dos saltos de línea tras el nombre del artículo
             bloque = f"📘 *{name}*\n\n{contenido}\n────────────────"
             bloques.append(bloque)
 
