@@ -145,11 +145,23 @@ def get_faq(format: str = "text"):
     """
     Devuelve el artículo de Preguntas Frecuentes en formato limpio para ManyChat.
     """
+    import re, html
+
     try:
-        # Buscar el artículo de Preguntas Frecuentes en Odoo
-        faq_records = API.env["knowledge.article"].search_read(
-            [("name", "ilike", "Preguntas Frecuentes")],
-            ["name", "body"]
+        # --- Autenticación ---
+        common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
+        uid = common.authenticate(ODOO_DB, ODOO_USER, ODOO_PASSWORD, {})
+        if not uid:
+            return {"faq_msg": "❌ Error de autenticación con Odoo."}
+
+        models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
+
+        # --- Buscar el artículo de FAQ ---
+        faq_records = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD,
+            "knowledge.article", "search_read",
+            [[("name", "ilike", "Preguntas Frecuentes")]],
+            {"fields": ["name", "body"], "limit": 1}
         )
 
         if not faq_records:
@@ -159,19 +171,16 @@ def get_faq(format: str = "text"):
         total = 0
 
         for record in faq_records:
-            name = record["name"]
+            name = record.get("name", "Preguntas Frecuentes")
             body = str(record.get("body", ""))
 
-            # --- Limpieza básica del HTML ---
-            import re
-            import html
+            # --- Limpieza del HTML ---
+            clean_body = html.unescape(body)
+            clean_body = re.sub(r"<[^>]*>", "", clean_body)
+            clean_body = clean_body.replace("\xa0", " ")
+            clean_body = re.sub(r"\n{3,}", "\n\n", clean_body).strip()
 
-            clean_body = html.unescape(body)                 # decodifica &nbsp;, &amp;, etc.
-            clean_body = re.sub(r"<[^>]*>", "", clean_body)  # elimina etiquetas HTML
-            clean_body = clean_body.replace("\xa0", " ")     # quita espacios especiales
-            clean_body = re.sub(r"\n{3,}", "\n\n", clean_body)  # colapsa saltos múltiples
-
-            mensajes.append(f"💬 *{name}*\n\n{clean_body.strip()}")
+            mensajes.append(f"💬 *{name}*\n\n{clean_body}")
             total += 1
 
         faq_msg = "\n\n".join(mensajes)
