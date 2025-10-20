@@ -317,7 +317,7 @@ async def register_interaction(request: Request):
             # update (write)
             models.execute_kw(
                 ODOO_DB, uid, ODOO_PASSWORD,
-                "x_interacciones_chatbot", "write",
+                "x_interacciones_chatbo", "write",
                 [existing_ids, vals]
             )
             rec_id = existing_ids[0]
