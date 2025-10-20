@@ -143,9 +143,15 @@ def get_inventario(
 @app.get("/faq")
 def get_faq(category: str = None, format: str = "text"):
     """
-    Devuelve las preguntas frecuentes en formato limpio y con estilo para ManyChat.
-    Si se pasa ?category=Nombre, filtra por esa categoría.
+    Devuelve FAQs con formato legible para ManyChat:
+    - Título del artículo en negritas
+    - Preguntas en negritas con 💬
+    - Listas con bullets
+    - Saltos de línea correctos entre bloques
     """
+    import re, html
+    from bs4 import BeautifulSoup
+
     try:
         # Autenticación
         common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
@@ -155,44 +161,70 @@ def get_faq(category: str = None, format: str = "text"):
 
         models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
 
-        # Dominio de búsqueda (por categoría)
+        # Dominio (filtra por categoría si la envías)
         domain = []
         if category:
             domain.append(["name", "ilike", category])
 
-        # Obtener artículos
+        # Traer artículos
         faq_records = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD,
             "knowledge.article", "search_read",
             [domain],
-            {"fields": ["name", "body"]}
+            {"fields": ["name", "body"], "order": "name asc", "limit": 10}
         )
 
         if not faq_records:
-            return {"faq_msg": f"⚠️ No se encontraron artículos para la categoría '{category}'."}
+            return {"faq_msg": f"⚠️ No se encontraron artículos para '{category}'."}
 
-        import re, html
-        mensajes = []
+        def format_article(raw_html: str) -> str:
+            soup = BeautifulSoup(raw_html or "", "html.parser")
+            chunks = []
 
-        for record in faq_records:
-            name = record["name"]
-            body = str(record.get("body", ""))
+            # Recorremos bloques que suelen aparecer en Knowledge
+            for el in soup.find_all(["h2", "h3", "p", "ul", "ol", "br"]):
+                # Texto del nodo
+                txt = el.get_text(" ", strip=True)
+                if not txt and el.name != "br":
+                    continue
 
-            # Limpieza básica de HTML
-            clean_body = html.unescape(body)
-            clean_body = re.sub(r"<[^>]+>", "", clean_body)
-            clean_body = clean_body.replace("\xa0", " ").strip()
+                if el.name in ("h2", "h3"):
+                    # Encabezados como sub-secciones (por si los usas)
+                    chunks.append(f"\n📘 *{txt.upper()}*\n")
 
-            # Formato tipo “sección elegante” para ManyChat
-            bloque = (
-                f"📘 *{name}*\n\n"
-                f"{clean_body}\n\n"
-                f"━━━━━━━━━━━━━━━"
-            )
-            mensajes.append(bloque)
+                elif el.name == "p":
+                    # Si termina con ?, lo tratamos como “pregunta”
+                    if txt.endswith("?"):
+                        chunks.append(f"\n💬 *{txt}*")
+                    else:
+                        chunks.append(txt)
 
-        faq_msg = "\n\n".join(mensajes)
-        return {"faq_msg": faq_msg, "total": len(mensajes)}
+                elif el.name in ("ul", "ol"):
+                    items = [f"• {li.get_text(' ', strip=True)}"
+                             for li in el.find_all("li")]
+                    if items:
+                        chunks.append("\n".join(items))
+
+                elif el.name == "br":
+                    chunks.append("")  # sólo salto
+
+            # Unimos y limpiamos saltos múltiples
+            text = "\n".join(chunks)
+            text = html.unescape(text).replace("\xa0", " ")
+            text = re.sub(r"\n{3,}", "\n\n", text).strip()
+            return text
+
+        bloques = []
+        for rec in faq_records:
+            name = rec.get("name", "Preguntas Frecuentes")
+            body = rec.get("body", "")
+
+            contenido = format_article(body)
+            bloque = f"📘 *{name}*\n\n{contenido}\n────────────────"
+            bloques.append(bloque)
+
+        faq_msg = "\n\n".join(bloques).strip()
+        return {"faq_msg": faq_msg, "total": len(bloques)}
 
     except Exception as e:
         return {"faq_msg": f"⚠️ Error al procesar las FAQ: {str(e)}"}
