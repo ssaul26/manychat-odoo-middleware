@@ -141,68 +141,44 @@ def get_inventario(
     except Exception as e:
         return {"catalogo_msg": f"⚠️ Hubo un error obteniendo el catálogo.\n\nDetalle: {str(e)}", "next_offset": 0}
 
-def _clean_html(raw):
-    """Convierte HTML de Odoo a texto plano bonito para chat."""
-    if raw is None:
-        return ""
-    if not isinstance(raw, str):
-        raw = str(raw)
-
-    # 1) Normalizar saltos de línea de bloques comunes
-    raw = (raw
-        .replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n")
-        .replace("</p>", "\n").replace("</li>", "\n").replace("</h1>", "\n")
-        .replace("</h2>", "\n").replace("</h3>", "\n").replace("</div>", "\n")
-    )
-
-    # 2) Quitar aperturas de tags de bloque (h1/p/li/ul/ol/div/spans con atributos raros)
-    raw = re.sub(r"<\s*(h[1-6]|p|li|ul|ol|div|span)[^>]*>", "", raw, flags=re.I)
-
-    # 3) Quitar cualquier otra etiqueta HTML restante
-    raw = re.sub(r"<[^>]+>", "", raw)
-
-    # 4) Decodificar entidades HTML (&nbsp;, &amp;, etc.)
-    raw = unescape(raw).replace("\xa0", " ")
-
-    # 5) Colapsar espacios/saltos excesivos
-    raw = re.sub(r"[ \t]+\n", "\n", raw)           # espacios al final de línea
-    raw = re.sub(r"\n{3,}", "\n\n", raw)           # máx dos saltos seguidos
-    return raw.strip()
-
-
 @app.get("/faq")
-def get_faq(format: str = Query("text", regex="^(json|text)$")):
+def get_faq(format: str = "text"):
     """
-    Lee 1 artículo general de Knowledge (nombre contiene 'Preguntas Frecuentes')
-    y devuelve texto plano apto para ManyChat en faq_msg.
+    Devuelve el artículo de Preguntas Frecuentes en formato limpio para ManyChat.
     """
     try:
-        # 1) Auth
-        common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
-        uid = common.authenticate(ODOO_DB, ODOO_USER, ODOO_PASSWORD, {})
-        if not uid:
-            return {"faq_msg": "❌ Error de autenticación con Odoo."}
-
-        models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
-
-        # 2) Buscar el artículo (ajusta el ilike si usas otro nombre)
-        recs = models.execute_kw(
-            ODOO_DB, uid, ODOO_PASSWORD,
-            'knowledge.article', 'search_read',
-            [[['active', '=', True], ['name', 'ilike', 'Preguntas Frecuentes']]],
-            {'fields': ['name', 'body'], 'limit': 1, 'order': 'id desc'}
+        # Buscar el artículo de Preguntas Frecuentes en Odoo
+        faq_records = API.env["knowledge.article"].search_read(
+            [("name", "ilike", "Preguntas Frecuentes")],
+            ["name", "body"]
         )
 
-        if not recs:
+        if not faq_records:
             return {"faq_msg": "⚠️ No se encontraron Preguntas Frecuentes."}
 
-        name = recs[0].get('name') or "Preguntas Frecuentes"
-        body = recs[0].get('body')
+        mensajes = []
+        total = 0
 
-        clean = _clean_html(body)
-        msg = f"💬 *{name}*\n\n{clean}" if clean else f"💬 *{name}*"
+        for record in faq_records:
+            name = record["name"]
+            body = str(record.get("body", ""))
 
-        return {"faq_msg": msg}  # ManyChat map: faq_msg -> faq_msg
+            # --- Limpieza básica del HTML ---
+            import re
+            import html
+
+            clean_body = html.unescape(body)                 # decodifica &nbsp;, &amp;, etc.
+            clean_body = re.sub(r"<[^>]*>", "", clean_body)  # elimina etiquetas HTML
+            clean_body = clean_body.replace("\xa0", " ")     # quita espacios especiales
+            clean_body = re.sub(r"\n{3,}", "\n\n", clean_body)  # colapsa saltos múltiples
+
+            mensajes.append(f"💬 *{name}*\n\n{clean_body.strip()}")
+            total += 1
+
+        faq_msg = "\n\n".join(mensajes)
+
+        return {"faq_msg": faq_msg, "total": total}
 
     except Exception as e:
-        return {"faq_msg": f"⚠️ Error obteniendo FAQ: {str(e)}"}
+        return {"faq_msg": f"⚠️ Error al procesar las FAQ: {str(e)}"}
+
