@@ -144,38 +144,45 @@ def get_inventario(
 @app.get("/faq")
 def get_faq(format: str = "json"):
     """
-    Endpoint para obtener las preguntas frecuentes desde Odoo
-    y devolverlas en texto limpio, formateadas para ManyChat.
+    Endpoint que obtiene el artículo de Preguntas Frecuentes desde Odoo
+    y devuelve texto limpio (sin etiquetas HTML) para ManyChat.
     """
 
     try:
-        # --- 1️⃣ Leer artículos del módulo 'knowledge.article' ---
+        # 🔹 Obtiene el registro (ajusta según tu ORM o API)
         faq_records = API.env["knowledge.article"].search_read(
             [("name", "ilike", "Preguntas Frecuentes")],
             ["name", "body"]
         )
 
         if not faq_records:
-            return {"error": "No se encontraron artículos FAQ"}
+            return {"error": "No se encontró ningún artículo de Preguntas Frecuentes."}
 
         mensajes = []
         total = 0
 
-        # --- 2️⃣ Limpiar HTML y dar formato amigable ---
         for record in faq_records:
-            soup = BeautifulSoup(record["body"], "html.parser")
-            clean_text = soup.get_text(separator="\n")
-            mensajes.append(f"💬 *{record['name']}*\n\n{clean_text.strip()}")
+            raw_body = record.get("body", "")
+
+            # 🔹 Manejo seguro (por si body es bool o dict)
+            if isinstance(raw_body, bool):
+                clean_text = ""
+            elif isinstance(raw_body, dict):
+                clean_text = str(raw_body)
+            else:
+                try:
+                    soup = BeautifulSoup(str(raw_body), "html.parser")
+                    clean_text = soup.get_text(separator="\n").strip()
+                except Exception:
+                    clean_text = str(raw_body)
+
+            mensajes.append(f"💬 *{record['name']}*\n\n{clean_text}")
             total += 1
 
-        # --- 3️⃣ Concatenar todas las FAQ ---
         faq_msg = "\n\n".join(mensajes)
 
-        # --- 4️⃣ Devolver resultado según formato ---
-        if format == "text":
-            return {"faq_msg": faq_msg, "total": total}
-        else:
-            return {"faq_msg": faq_msg, "total": total}
+        # 🔹 Respuesta limpia
+        return {"faq_msg": faq_msg, "total": total}
 
     except Exception as e:
-        return {"error": f"⚠️ Ocurrió un error: {str(e)}"}
+        return {"error": f"⚠️ Error en el procesamiento: {str(e)}"}
