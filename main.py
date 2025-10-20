@@ -241,7 +241,7 @@ async def register_interaction(request: Request):
             ODOO_DB,
             uid,
             ODOO_PASSWORD,
-            "x_interacciones_chatbot",  # nombre técnico del modelo
+            "x_interacciones_chatbo",  # nombre técnico del modelo
             "create",
             [
                 {
