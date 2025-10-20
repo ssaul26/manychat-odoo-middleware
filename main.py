@@ -210,6 +210,27 @@ def get_faq(category: str = None, format: str = "text"):
     except Exception as e:
         return {"faq_msg": f"⚠️ Error al procesar las FAQ: {str(e)}"}
 
+def normalize_datetime(s: str | None) -> str:
+    """
+    Convierte cualquier fecha entrante a 'YYYY-MM-DD HH:MM:SS' (sin microsegundos).
+    Si no viene fecha, usa UTC ahora.
+    """
+    if not s:
+        return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    # Intentamos varios formatos comunes
+    try:
+        # ISO con o sin microsegundos / con 'T'
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        try:
+            # ManyChat suele mandar 'YYYY-MM-DD HH:MM:SS'
+            dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            # Respaldo: ahora en UTC
+            dt = datetime.utcnow()
+    # Devolver sin microsegundos
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
 @app.post("/register_interaction")
 async def register_interaction(request: Request):
     try:
