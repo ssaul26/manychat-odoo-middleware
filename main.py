@@ -2,6 +2,7 @@ from fastapi import FastAPI, Query
 import xmlrpc.client
 import os
 from collections import defaultdict, OrderedDict
+from bs4 import BeautifulSoup 
 
 app = FastAPI()
 
