@@ -141,49 +141,66 @@ def get_inventario(
         return {"catalogo_msg": f"⚠️ Hubo un error obteniendo el catálogo.\n\nDetalle: {str(e)}", "next_offset": 0}
 
 @app.get("/faq")
-def get_faq(
-    format: str = Query("text", regex="^(json|text)$", description="json (default) o text")
-):
+def get_faq(format: str = Query("json", regex="^(json|text)$")):
     """
-    Devuelve todas las preguntas frecuentes del módulo Knowledge (sin filtrar por escuela).
+    Devuelve las preguntas frecuentes del módulo 'Información' (Knowledge) de Odoo.
+    Está diseñado para mostrar UN artículo general (ej: 'Preguntas Frecuentes Sporthouse').
     """
+
     try:
+        # 1️⃣ Autenticación
         common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
         uid = common.authenticate(ODOO_DB, ODOO_USER, ODOO_PASSWORD, {})
         if not uid:
-            return {"error": "❌ Error de autenticación con Odoo."}
+            return {"faq_msg": "❌ Error de autenticación con Odoo."}
 
         models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
 
-        # Leer los artículos activos de Knowledge
+        # 2️⃣ Buscar artículo que contenga “Preguntas Frecuentes”
         articulos = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD,
             'knowledge.article', 'search_read',
-            [[['active', '=', True]]],
-            {'fields': ['name', 'body'], 'limit': 10, 'order': 'create_date asc'}
+            [[['active', '=', True], ['name', 'ilike', 'Preguntas Frecuentes']]],
+            {'fields': ['name', 'body'], 'limit': 1}
         )
 
         if not articulos:
-            return {"faq_msg": "No se encontraron preguntas frecuentes.", "total": 0}
+            return {"faq_msg": "⚠️ No se encontraron preguntas frecuentes."}
 
-        # Construir texto para ManyChat
-        bloques = []
-        for art in articulos:
-            nombre = art.get('name', 'Artículo sin nombre')
-            cuerpo = art.get('body') or ''
-            if not isinstance(cuerpo, str):
-                cuerpo = str(cuerpo)
-            cuerpo = cuerpo.replace("<p>", "").replace("</p>", "")
+        art = articulos[0]
+        nombre = art.get('name', 'Preguntas Frecuentes')
+        cuerpo = art.get('body') or ''
 
-            bloques.append(f"⭐ *{nombre}*\n\n{cuerpo}")
+        # 3️⃣ Convertir HTML a texto limpio
+        if not isinstance(cuerpo, str):
+            cuerpo = str(cuerpo)
 
-        msg = "\n\n".join(bloques)
+        reemplazos = {
+            "<p>": "",
+            "</p>": "\n",
+            "<br>": "\n",
+            "<br/>": "\n",
+            "&nbsp;": " ",
+            "<strong>": "*",
+            "</strong>": "*",
+            "<b>": "*",
+            "</b>": "*",
+            "<em>": "_",
+            "</em>": "_",
+        }
+        for k, v in reemplazos.items():
+            cuerpo = cuerpo.replace(k, v)
 
+        cuerpo = cuerpo.strip()
+
+        # 4️⃣ Construcción del mensaje
+        faq_msg = f"💬 *{nombre}*\n\n{cuerpo}"
+
+        # 5️⃣ Salida según formato
         if format == "json":
-            return {"articulos": articulos, "total": len(articulos)}
+            return {"faq_msg": faq_msg}
         else:
-            return {"faq_msg": msg, "total": len(articulos)}
+            return {"faq_msg": faq_msg}
 
     except Exception as e:
-        return {"error": f"⚠️ Ocurrió un error: {str(e)}"}
-
+        return {"faq_msg": f"⚠️ Error obteniendo FAQ: {str(e)}"}
