@@ -63,11 +63,9 @@ def get_inventario(
         )
 
         # 4) Normalización + TODOS los atributos del template
-        #    Usamos product.template.attribute.value para obtener pares (atributo, valor)
         PREFERRED_ORDER = ["Tipo de tela", "Sexo", "Color", "Talla"]  # orden visual sugerido
 
         def normalize_template(t):
-            # atributos: { "Color": ["NAVY BLUE","VERDE"], "Talla": ["4","6","8","10"], ... }
             atributos = defaultdict(list)
             try:
                 ptavs = models.execute_kw(
@@ -79,9 +77,8 @@ def get_inventario(
                 for v in ptavs:
                     attr_name = v['attribute_id'][1] if v.get('attribute_id') else None
                     val_name = v.get('name')
-                    if attr_name and val_name:
-                        if val_name not in atributos[attr_name]:
-                            atributos[attr_name].append(val_name)
+                    if attr_name and val_name and val_name not in atributos[attr_name]:
+                        atributos[attr_name].append(val_name)
             except Exception:
                 pass
 
@@ -98,10 +95,10 @@ def get_inventario(
                 "id": t["id"],
                 "name": t.get("name"),
                 "price": t.get("list_price"),
-                "stock": t.get("qty_available"),  # suma de variantes
+                "stock": t.get("qty_available"),   # numérico (suma de variantes)
                 "template": t.get("name"),
                 "category": t["categ_id"][1] if t.get("categ_id") else None,
-                "attributes": ordered,            # <- TODOS los atributos
+                "attributes": ordered,
                 "sku": None,
                 "barcode": None
             }
@@ -113,6 +110,7 @@ def get_inventario(
 
         # 6) Salidas
         if format == "json":
+            # En JSON mantenemos cantidad numérica
             return {"productos": items, "next_offset": next_offset}
 
         # ---- format == "text" (para ManyChat) ----
@@ -122,13 +120,15 @@ def get_inventario(
 
         bloques = []
         for it in items:
+            stock_qty = int(it.get('stock') or 0)
+            stock_label = "DISPONIBLE" if stock_qty > 0 else "NO DISPONIBLE"
+
             lineas = [
                 f"⭐ *{it.get('name') or 'Producto'}*",
                 f"💰 Precio: ${it.get('price') or 0}",
-                f"📦 Stock: {int(it.get('stock') or 0)}",
+                f"📦 {stock_label}",               # <<-- aquí el cambio de presentación
             ]
             attrs = it.get("attributes") or {}
-            # 🔥 Mostrar TODOS los atributos y TODOS sus valores
             for attr_name, values in attrs.items():
                 if values:
                     lineas.append(f"• {attr_name}: {', '.join(values)}")
