@@ -141,7 +141,6 @@ def get_inventario(
     except Exception as e:
         return {"catalogo_msg": f"⚠️ Hubo un error obteniendo el catálogo.\n\nDetalle: {str(e)}", "next_offset": 0}
 
-
 @app.get("/faq")
 def get_faq(category: str = None, format: str = "text"):
     """
@@ -155,7 +154,7 @@ def get_faq(category: str = None, format: str = "text"):
     from bs4 import BeautifulSoup
 
     try:
-        # --- Autenticación con Odoo ---
+        # Autenticación
         common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
         uid = common.authenticate(ODOO_DB, ODOO_USER, ODOO_PASSWORD, {})
         if not uid:
@@ -163,12 +162,12 @@ def get_faq(category: str = None, format: str = "text"):
 
         models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
 
-        # --- Dominio (filtra por categoría si se pasa el parámetro) ---
+        # Dominio (filtra por categoría si la envías)
         domain = []
         if category:
             domain.append(["name", "ilike", category])
 
-        # --- Leer artículos desde Odoo ---
+        # Traer artículos
         faq_records = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD,
             "knowledge.article", "search_read",
@@ -179,40 +178,43 @@ def get_faq(category: str = None, format: str = "text"):
         if not faq_records:
             return {"faq_msg": f"⚠️ No se encontraron artículos para '{category}'."}
 
-        # --- Función para limpiar y dar formato al HTML ---
         def format_article(raw_html: str) -> str:
             soup = BeautifulSoup(raw_html or "", "html.parser")
             chunks = []
 
+            # Recorremos bloques que suelen aparecer en Knowledge
             for el in soup.find_all(["h2", "h3", "p", "ul", "ol", "br"]):
+                # Texto del nodo
                 txt = el.get_text(" ", strip=True)
                 if not txt and el.name != "br":
                     continue
 
                 if el.name in ("h2", "h3"):
+                    # Encabezados como sub-secciones (por si los usas)
                     chunks.append(f"\n📘 *{txt.upper()}*\n")
 
                 elif el.name == "p":
+                    # Si termina con ?, lo tratamos como “pregunta”
                     if txt.endswith("?"):
                         chunks.append(f"\n💬 *{txt}*")
                     else:
-                        chunks.append(f"\n{txt}")
+                        chunks.append(txt)
 
                 elif el.name in ("ul", "ol"):
                     items = [f"• {li.get_text(' ', strip=True)}"
                              for li in el.find_all("li")]
                     if items:
-                        chunks.append("\n" + "\n".join(items))
+                        chunks.append("\n".join(items))
 
                 elif el.name == "br":
-                    chunks.append("\n")
+                    chunks.append("")  # sólo salto
 
-            text = "".join(chunks)
+            # Unimos y limpiamos saltos múltiples
+            text = "\n".join(chunks)
             text = html.unescape(text).replace("\xa0", " ")
             text = re.sub(r"\n{3,}", "\n\n", text).strip()
             return text
 
-        # --- Construir bloques de texto para ManyChat ---
         bloques = []
         for rec in faq_records:
             name = rec.get("name", "Preguntas Frecuentes")
@@ -227,3 +229,4 @@ def get_faq(category: str = None, format: str = "text"):
 
     except Exception as e:
         return {"faq_msg": f"⚠️ Error al procesar las FAQ: {str(e)}"}
+
