@@ -170,7 +170,11 @@ def get_faq(
         bloques = []
         for art in articulos:
             nombre = art.get('name', 'Artículo sin nombre')
-            cuerpo = art.get('body', '').replace("<p>", "").replace("</p>", "")
+            cuerpo = art.get('body') or ''
+            if not isinstance(cuerpo, str):
+                cuerpo = str(cuerpo)
+            cuerpo = cuerpo.replace("<p>", "").replace("</p>", "")
+
             bloques.append(f"⭐ *{nombre}*\n\n{cuerpo}")
 
         msg = "\n\n".join(bloques)
