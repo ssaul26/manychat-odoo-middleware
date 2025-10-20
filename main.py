@@ -231,41 +231,107 @@ def normalize_datetime(s: str | None) -> str:
     # Respaldo
     return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
+from fastapi import FastAPI, Request
+import xmlrpc.client, os
+from datetime import datetime
+
+app = FastAPI()
+
+ODOO_URL      = os.getenv("ODOO_URL")
+ODOO_DB       = os.getenv("ODOO_DB")
+ODOO_USER     = os.getenv("ODOO_USER")
+ODOO_PASSWORD = os.getenv("ODOO_PASSWORD")
+
+def normalize_datetime(s: str | None) -> str:
+    if not s:
+        return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    # Intenta varios formatos comunes (incluye el de ManyChat: '20 Oct 2025, 05:41pm')
+    for parser in (
+        lambda x: datetime.fromisoformat(x.replace("Z", "+00:00")),        # ISO
+        lambda x: datetime.strptime(x, "%d %b %Y, %I:%M%p"),               # 20 Oct 2025, 05:41pm
+        lambda x: datetime.strptime(x, "%d %B %Y, %I:%M%p"),               # 20 October 2025, 05:41pm
+        lambda x: datetime.strptime(x, "%Y-%m-%d %H:%M:%S"),               # 2025-10-20 17:41:00
+        lambda x: datetime.strptime(x, "%Y-%m-%dT%H:%M:%S.%f"),            # 2025-10-20T17:41:00.123456
+        lambda x: datetime.strptime(x, "%Y-%m-%dT%H:%M:%S"),               # 2025-10-20T17:41:00
+    ):
+        try:
+            dt = parser(s)
+            return dt.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            continue
+    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
 @app.post("/register_interaction")
 async def register_interaction(request: Request):
     try:
         data = await request.json()
 
-        messenger_id = data.get("messenger_id")
-        canal        = data.get("canal")
-        evento       = data.get("evento")
-        fecha_raw    = data.get("fecha")
-        fecha_norm   = normalize_datetime(fecha_raw)   # ← AQUÍ normalizamos
+        messenger_id = (data.get("messenger_id") or "").strip()
+        canal        = (data.get("canal") or "").strip()
+        evento       = (data.get("evento") or "").strip()
+        fecha_norm   = normalize_datetime(data.get("fecha"))
+        telefono     = (data.get("telefono") or "").strip()
+        correo       = (data.get("correo") or "").strip()
+        nombre       = (data.get("nombre") or "").strip()
 
         if not messenger_id:
             return {"status": "error", "message": "Falta messenger_id"}
 
+        # 1) Autenticación
         common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
         uid = common.authenticate(ODOO_DB, ODOO_USER, ODOO_PASSWORD, {})
         if not uid:
             return {"status": "error", "message": "❌ Error de autenticación en Odoo."}
-
         models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
 
+        # 2) Construimos valores a guardar (ajusta nombres técnicos si difieren)
         vals = {
-            "x_name": f"{(canal or 'Canal')} - {(evento or 'Interacción')} - {messenger_id}",
-            "x_studio_messeger_id": messenger_id,   # respeta el nombre técnico exacto
+            "x_name": f"{canal or 'Canal'} - {evento or 'Interacción'} - {messenger_id}",
+            "x_studio_messeger_id": messenger_id,   # si en Studio es x_studio_messenger_id, cambia aquí
             "x_studio_channel":     canal,
             "x_studio_event":       evento,
-            "x_studio_timestamp":   fecha_norm,     # ← USAMOS LA FECHA NORMALIZADA
+            "x_studio_timestamp":   fecha_norm,
+            "x_studio_phone":       telefono,
+            "x_studio_email":       correo,
         }
 
-        rec_id = models.execute_kw(
-            ODOO_DB, uid, ODOO_PASSWORD,
-            "x_interacciones_chatbo",              # confirma el nombre del modelo
-            "create", [vals]
-        )
-        return {"status": "success", "record_id": rec_id}
+        # 3) DEDUPE / UPSERT
+        # Regla: buscar por messenger_id; si no hay, intenta por correo; si no por teléfono.
+        domain = []
+        if messenger_id:
+            domain = [["x_studio_messeger_id", "=", messenger_id]]
+        elif correo:
+            domain = [["x_studio_email", "=", correo]]
+        elif telefono:
+            domain = [["x_studio_phone", "=", telefono]]
+
+        existing_ids = []
+        if domain:
+            existing_ids = models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD,
+                "x_interacciones_chatbot", "search",
+                [domain], {"limit": 1}
+            )
+
+        if existing_ids:
+            # update (write)
+            models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD,
+                "x_interacciones_chatbot", "write",
+                [existing_ids, vals]
+            )
+            rec_id = existing_ids[0]
+            action = "updated"
+        else:
+            # create
+            rec_id = models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD,
+                "x_interacciones_chatbot", "create",
+                [vals]
+            )
+            action = "created"
+
+        return {"status": "success", "action": action, "record_id": rec_id}
 
     except Exception as e:
         return {"status": "error", "message": f"Error al registrar interacción: {str(e)}"}
