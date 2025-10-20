@@ -2,6 +2,7 @@ from fastapi import FastAPI, Query
 import xmlrpc.client
 import os
 from collections import defaultdict, OrderedDict
+from datetime import datetime
 
 app = FastAPI()
 
@@ -207,3 +208,43 @@ def get_faq(category: str = None, format: str = "text"):
 
     except Exception as e:
         return {"faq_msg": f"⚠️ Error al procesar las FAQ: {str(e)}"}
+
+@app.post("/register_interaction")
+async def register_interaction(request: Request):
+    """
+    Recibe datos desde ManyChat y los guarda en el modelo "Interacciones Chatbot" de Odoo.
+    """
+    try:
+        data = await request.json()
+
+        # --- Variables esperadas desde ManyChat ---
+        messenger_id = data.get("messenger_id")
+        canal = data.get("canal")
+        evento = data.get("evento")
+        fecha = data.get("fecha") or datetime.utcnow().isoformat()
+
+        # --- Autenticación con Odoo ---
+        common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
+        uid = common.authenticate(ODOO_DB, ODOO_USER, ODOO_PASSWORD, {})
+        if not uid:
+            return {"status": "error", "message": "❌ Error de autenticación en Odoo."}
+
+        models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
+
+        # --- Creación del registro en Odoo ---
+        record_id = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD,
+            "x_interacciones_chatbot",  # nombre técnico del modelo creado con Studio
+            "create",
+            [{
+                "x_studio_messenger_id": messenger_id,
+                "x_studio_canal": canal,
+                "x_studio_evento": evento,
+                "x_studio_fecha_de_interaccion": fecha,
+            }]
+        )
+
+        return {"status": "success", "record_id": record_id}
+
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
