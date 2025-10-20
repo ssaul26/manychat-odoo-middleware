@@ -165,7 +165,7 @@ def get_faq(category: str = None, format: str = "text"):
             ODOO_DB, uid, ODOO_PASSWORD,
             "knowledge.article", "search_read",
             [domain],
-            ["name", "body"]
+            {"fields": ["name", "body"]}
         )
 
         if not faq_records:
