@@ -308,7 +308,7 @@ async def register_interaction(request: Request):
         if domain:
             existing_ids = models.execute_kw(
                 ODOO_DB, uid, ODOO_PASSWORD,
-                "x_interacciones_chatbot", "search",
+                "x_interacciones_chatbo", "search",
                 [domain], {"limit": 1}
             )
 
