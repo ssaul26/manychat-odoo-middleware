@@ -178,42 +178,62 @@ def get_faq(category: str = None, format: str = "text"):
         if not faq_records:
             return {"faq_msg": f"⚠️ No se encontraron artículos para '{category}'."}
 
+        # 🛠️ FUNCIÓN CORREGIDA
         def format_article(raw_html: str) -> str:
             soup = BeautifulSoup(raw_html or "", "html.parser")
             chunks = []
 
             # Recorremos bloques que suelen aparecer en Knowledge
-            for el in soup.find_all(["h2", "h3", "p", "ul", "ol", "br"]):
+            for el in soup.find_all(["h2", "h3", "p", "ul", "ol", "li", "br"]):
                 # Texto del nodo
                 txt = el.get_text(" ", strip=True)
+                
+                # Manejo de casos especiales para listas y vacíos
+                if el.name in ("li",) and not txt: 
+                    continue
                 if not txt and el.name != "br":
                     continue
+                
+                # Nota: Li's serán manejados por su padre ul/ol. 
+                # Si el.name == "li", ya lo procesaremos en ul/ol, 
+                # pero nos aseguramos de no procesar los li's por separado si ya tienen texto.
+                if el.name == "li" and el.parent and el.parent.name in ("ul", "ol"):
+                    continue 
 
                 if el.name in ("h2", "h3"):
-                    # Encabezados como sub-secciones (por si los usas)
-                    chunks.append(f"\n📘 *{txt.upper()}*\n")
+                    # Separación fuerte para títulos de sección
+                    chunks.append(f"\n\n📘 *{txt.upper()}*")
 
                 elif el.name == "p":
                     # Si termina con ?, lo tratamos como “pregunta”
                     if txt.endswith("?"):
+                        # Asegurar un salto de línea ANTES de la pregunta
                         chunks.append(f"\n💬 *{txt}*")
                     else:
-                        chunks.append(txt)
+                        # Para párrafos de respuesta, asegurar un salto DESPUÉS de la pregunta
+                        # o una separación de un párrafo anterior
+                        # El primer párrafo tendrá un salto, los siguientes dos saltos.
+                        chunks.append(f"\n{txt}")
 
                 elif el.name in ("ul", "ol"):
                     items = [f"• {li.get_text(' ', strip=True)}"
-                             for li in el.find_all("li")]
+                             for li in el.find_all("li") if li.get_text(" ", strip=True)]
                     if items:
-                        chunks.append("\n".join(items))
+                        # Asegurar un salto de línea antes de la lista
+                        chunks.append("\n" + "\n".join(items))
 
                 elif el.name == "br":
-                    chunks.append("")  # sólo salto
+                    chunks.append("\n") # salto de línea explícito
 
             # Unimos y limpiamos saltos múltiples
-            text = "\n".join(chunks)
+            # Unir con string vacío para tener control total de los \n
+            text = "".join(chunks)
+
             text = html.unescape(text).replace("\xa0", " ")
+            # Limpiamos 3 o más saltos seguidos a solo 2 saltos.
             text = re.sub(r"\n{3,}", "\n\n", text).strip()
             return text
+        # 🛠️ FIN FUNCIÓN CORREGIDA
 
         bloques = []
         for rec in faq_records:
@@ -221,6 +241,7 @@ def get_faq(category: str = None, format: str = "text"):
             body = rec.get("body", "")
 
             contenido = format_article(body)
+            # Aseguramos dos saltos de línea tras el nombre del artículo
             bloque = f"📘 *{name}*\n\n{contenido}\n────────────────"
             bloques.append(bloque)
 
