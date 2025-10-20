@@ -141,48 +141,68 @@ def get_inventario(
     except Exception as e:
         return {"catalogo_msg": f"⚠️ Hubo un error obteniendo el catálogo.\n\nDetalle: {str(e)}", "next_offset": 0}
 
-@app.get("/faq")
-def get_faq(format: str = "json"):
-    """
-    Endpoint que obtiene el artículo de Preguntas Frecuentes desde Odoo
-    y devuelve texto limpio (sin etiquetas HTML) para ManyChat.
-    """
+def _clean_html(raw):
+    """Convierte HTML de Odoo a texto plano bonito para chat."""
+    if raw is None:
+        return ""
+    if not isinstance(raw, str):
+        raw = str(raw)
 
+    # 1) Normalizar saltos de línea de bloques comunes
+    raw = (raw
+        .replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n")
+        .replace("</p>", "\n").replace("</li>", "\n").replace("</h1>", "\n")
+        .replace("</h2>", "\n").replace("</h3>", "\n").replace("</div>", "\n")
+    )
+
+    # 2) Quitar aperturas de tags de bloque (h1/p/li/ul/ol/div/spans con atributos raros)
+    raw = re.sub(r"<\s*(h[1-6]|p|li|ul|ol|div|span)[^>]*>", "", raw, flags=re.I)
+
+    # 3) Quitar cualquier otra etiqueta HTML restante
+    raw = re.sub(r"<[^>]+>", "", raw)
+
+    # 4) Decodificar entidades HTML (&nbsp;, &amp;, etc.)
+    raw = unescape(raw).replace("\xa0", " ")
+
+    # 5) Colapsar espacios/saltos excesivos
+    raw = re.sub(r"[ \t]+\n", "\n", raw)           # espacios al final de línea
+    raw = re.sub(r"\n{3,}", "\n\n", raw)           # máx dos saltos seguidos
+    return raw.strip()
+
+
+@app.get("/faq")
+def get_faq(format: str = Query("text", regex="^(json|text)$")):
+    """
+    Lee 1 artículo general de Knowledge (nombre contiene 'Preguntas Frecuentes')
+    y devuelve texto plano apto para ManyChat en faq_msg.
+    """
     try:
-        # 🔹 Obtiene el registro (ajusta según tu ORM o API)
-        faq_records = API.env["knowledge.article"].search_read(
-            [("name", "ilike", "Preguntas Frecuentes")],
-            ["name", "body"]
+        # 1) Auth
+        common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
+        uid = common.authenticate(ODOO_DB, ODOO_USER, ODOO_PASSWORD, {})
+        if not uid:
+            return {"faq_msg": "❌ Error de autenticación con Odoo."}
+
+        models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
+
+        # 2) Buscar el artículo (ajusta el ilike si usas otro nombre)
+        recs = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD,
+            'knowledge.article', 'search_read',
+            [[['active', '=', True], ['name', 'ilike', 'Preguntas Frecuentes']]],
+            {'fields': ['name', 'body'], 'limit': 1, 'order': 'id desc'}
         )
 
-        if not faq_records:
-            return {"error": "No se encontró ningún artículo de Preguntas Frecuentes."}
+        if not recs:
+            return {"faq_msg": "⚠️ No se encontraron Preguntas Frecuentes."}
 
-        mensajes = []
-        total = 0
+        name = recs[0].get('name') or "Preguntas Frecuentes"
+        body = recs[0].get('body')
 
-        for record in faq_records:
-            raw_body = record.get("body", "")
+        clean = _clean_html(body)
+        msg = f"💬 *{name}*\n\n{clean}" if clean else f"💬 *{name}*"
 
-            # 🔹 Manejo seguro (por si body es bool o dict)
-            if isinstance(raw_body, bool):
-                clean_text = ""
-            elif isinstance(raw_body, dict):
-                clean_text = str(raw_body)
-            else:
-                try:
-                    soup = BeautifulSoup(str(raw_body), "html.parser")
-                    clean_text = soup.get_text(separator="\n").strip()
-                except Exception:
-                    clean_text = str(raw_body)
-
-            mensajes.append(f"💬 *{record['name']}*\n\n{clean_text}")
-            total += 1
-
-        faq_msg = "\n\n".join(mensajes)
-
-        # 🔹 Respuesta limpia
-        return {"faq_msg": faq_msg, "total": total}
+        return {"faq_msg": msg}  # ManyChat map: faq_msg -> faq_msg
 
     except Exception as e:
-        return {"error": f"⚠️ Error en el procesamiento: {str(e)}"}
+        return {"faq_msg": f"⚠️ Error obteniendo FAQ: {str(e)}"}
