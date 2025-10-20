@@ -211,38 +211,24 @@ def get_faq(category: str = None, format: str = "text"):
         return {"faq_msg": f"⚠️ Error al procesar las FAQ: {str(e)}"}
 
 def normalize_datetime(s: str | None) -> str:
-    """
-    Devuelve 'YYYY-MM-DD HH:MM:SS' (sin microsegundos) para lo que llegue de ManyChat.
-    """
     if not s:
         return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
-    # Intenta varios formatos comunes
-    candidates = [
-        # ISO con o sin microsegundos y con 'T' o 'Z'
-        (lambda x: datetime.fromisoformat(x.replace("Z", "+00:00"))),
-        # ManyChat (ej: '20 Oct 2025, 05:41pm')
-        (lambda x: datetime.strptime(x, "%d %b %Y, %I:%M%p")),
-        # Variante con mes completo por si acaso ('October')
-        (lambda x: datetime.strptime(x, "%d %B %Y, %I:%M%p")),
-        # Clásico 'YYYY-MM-DD HH:MM:SS'
-        (lambda x: datetime.strptime(x, "%Y-%m-%d %H:%M:%S")),
-        # ISO sin zona pero con microsegundos
-        (lambda x: datetime.strptime(x, "%Y-%m-%dT%H:%M:%S.%f")),
-        # ISO sin microsegundos
-        (lambda x: datetime.strptime(x, "%Y-%m-%dT%H:%M:%S")),
-    ]
-
-    for parser in candidates:
+    # Intenta varios formatos (incluye el de ManyChat: '20 Oct 2025, 05:41pm')
+    for parser in (
+        lambda x: datetime.fromisoformat(x.replace("Z", "+00:00")),        # ISO
+        lambda x: datetime.strptime(x, "%d %b %Y, %I:%M%p"),               # 20 Oct 2025, 05:41pm
+        lambda x: datetime.strptime(x, "%d %B %Y, %I:%M%p"),               # 20 October 2025, 05:41pm
+        lambda x: datetime.strptime(x, "%Y-%m-%d %H:%M:%S"),               # 2025-10-20 17:41:00
+        lambda x: datetime.strptime(x, "%Y-%m-%dT%H:%M:%S.%f"),            # 2025-10-20T17:41:00.123456
+        lambda x: datetime.strptime(x, "%Y-%m-%dT%H:%M:%S"),               # 2025-10-20T17:41:00
+    ):
         try:
             dt = parser(s)
-            # Si nos dieron un aware con tzinfo, puedes convertir a UTC si quieres.
-            # Para Odoo basta con quitar microsegundos y devolver string simple:
             return dt.strftime("%Y-%m-%d %H:%M:%S")
         except Exception:
             continue
-
-    # Si nada funcionó, usa ahora UTC como respaldo
+    # Respaldo
     return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
 @app.post("/register_interaction")
@@ -253,7 +239,8 @@ async def register_interaction(request: Request):
         messenger_id = data.get("messenger_id")
         canal        = data.get("canal")
         evento       = data.get("evento")
-        fecha        = data.get("fecha") or datetime.utcnow().isoformat()
+        fecha_raw    = data.get("fecha")
+        fecha_norm   = normalize_datetime(fecha_raw)   # ← AQUÍ normalizamos
 
         if not messenger_id:
             return {"status": "error", "message": "Falta messenger_id"}
@@ -265,23 +252,20 @@ async def register_interaction(request: Request):
 
         models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
 
-        # Ajusta estos nombres a los técnicos reales de tus campos en Studio
         vals = {
-            "x_name": f"{canal or 'Canal'} - {evento or 'Interacción'} - {messenger_id}",  # <-- Descripción obligatoria
-            "x_studio_messeger_id": messenger_id,   # o x_studio_messenger_id si así está en tu Studio
+            "x_name": f"{(canal or 'Canal')} - {(evento or 'Interacción')} - {messenger_id}",
+            "x_studio_messeger_id": messenger_id,   # respeta el nombre técnico exacto
             "x_studio_channel":     canal,
             "x_studio_event":       evento,
-            "x_studio_timestamp":   fecha,
+            "x_studio_timestamp":   fecha_norm,     # ← USAMOS LA FECHA NORMALIZADA
         }
 
-        record_id = models.execute_kw(
+        rec_id = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD,
-            "x_interacciones_chatbo",   # <-- con 't'
-            "create",
-            [vals]
+            "x_interacciones_chatbo",              # confirma el nombre del modelo
+            "create", [vals]
         )
-
-        return {"status": "success", "record_id": record_id}
+        return {"status": "success", "record_id": rec_id}
 
     except Exception as e:
         return {"status": "error", "message": f"Error al registrar interacción: {str(e)}"}
