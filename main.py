@@ -143,11 +143,9 @@ def get_inventario(
 @app.get("/faq")
 def get_faq(format: str = "text"):
     """
-    Devuelve el artículo de Preguntas Frecuentes dividido en secciones,
-    manteniendo formato con negritas y emojis para ManyChat.
+    Devuelve el artículo de Preguntas Frecuentes en formato limpio para ManyChat.
     """
     import re, html
-    from bs4 import BeautifulSoup
 
     try:
         # --- Autenticación ---
@@ -158,7 +156,7 @@ def get_faq(format: str = "text"):
 
         models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
 
-        # --- Buscar artículo de FAQ ---
+        # --- Buscar el artículo de FAQ ---
         faq_records = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD,
             "knowledge.article", "search_read",
@@ -169,42 +167,27 @@ def get_faq(format: str = "text"):
         if not faq_records:
             return {"faq_msg": "⚠️ No se encontraron Preguntas Frecuentes."}
 
-        # --- Extraer y limpiar contenido HTML ---
-        record = faq_records[0]
-        name = record.get("name", "Preguntas Frecuentes")
-        raw_html = record.get("body", "")
+        mensajes = []
+        total = 0
 
-        soup = BeautifulSoup(raw_html, "html.parser")
-        sections = []
-        current_section = ""
+        for record in faq_records:
+            name = record.get("name", "Preguntas Frecuentes")
+            body = str(record.get("body", ""))
 
-        for element in soup.find_all(["h2", "h3", "p", "ul", "ol"]):
-            text = element.get_text(strip=True)
-            if not text:
-                continue
+            # --- Limpieza del HTML ---
+            clean_body = html.unescape(body)
+            clean_body = re.sub(r"<[^>]*>", "", clean_body)
+            clean_body = clean_body.replace("\xa0", " ")
+            clean_body = re.sub(r"\n{3,}", "\n\n", clean_body).strip()
 
-            # Identificar secciones por encabezados
-            if element.name in ["h2", "h3"]:
-                if current_section:
-                    sections.append(current_section.strip())
-                current_section = f"\n\n📘 *{text.upper()}*\n"
-            else:
-                # Convertir listas y párrafos en texto plano con saltos
-                if element.name in ["ul", "ol"]:
-                    items = [f"• {li.get_text(strip=True)}" for li in element.find_all('li')]
-                    current_section += "\n" + "\n".join(items)
-                else:
-                    current_section += "\n" + text
+            mensajes.append(f"💬 *{name}*\n\n{clean_body}")
+            total += 1
 
-        if current_section:
-            sections.append(current_section.strip())
+        faq_msg = "\n\n".join(mensajes)
 
-        # --- Formato final ---
-        formatted_text = f"💬 *{name}*\n" + "\n\n".join(sections)
-        formatted_text = html.unescape(formatted_text)
-        formatted_text = re.sub(r"\n{3,}", "\n\n", formatted_text)
-
-        return {"faq_msg": formatted_text.strip(), "total": len(sections)}
+        return {"faq_msg": faq_msg, "total": total}
 
     except Exception as e:
         return {"faq_msg": f"⚠️ Error al procesar las FAQ: {str(e)}"}
+
+
