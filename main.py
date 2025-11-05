@@ -202,6 +202,9 @@ def get_faq(category: str = None, format: str = "text"):
             texto = re.sub(r"\n{3,}", "\n\n", texto)  # compactar saltos
 
 
+            bloque = f"\n📘 *{name}*\n{texto}\n\n"
+            bloques.append(bloque)
+        
         faq_msg = "\n".join(bloques).strip()
         return {"faq_msg": faq_msg, "total": len(bloques)}
 
