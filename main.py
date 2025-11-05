@@ -328,3 +328,97 @@ async def register_interaction(request: Request):
 
     except Exception as e:
         return {"status": "error", "message": f"Error al registrar interacción: {str(e)}"}
+
+
+# --- NUEVO: helpers para formato ---
+def _format_money(amount: float, symbol: str = os.getenv("CURRENCY_SYMBOL", "$")) -> str:
+    try:
+        return f"{symbol} {float(amount):,.2f}"
+    except Exception:
+        return f"{symbol} {amount}"
+
+def _format_odoo_datetime(s: str | None) -> str:
+    """
+    sale.order.date_order suele venir como 'YYYY-MM-DD HH:MM:SS' (UTC).
+    Dejamos un formato simple dd/mm/YYYY HH:MM sin timezone.
+    """
+    if not s:
+        return ""
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(s, fmt)
+            return dt.strftime("%d/%m/%Y %H:%M") if fmt.endswith("%S") else dt.strftime("%d/%m/%Y")
+        except Exception:
+            continue
+    return s  # si no se pudo parsear, regresa crudo
+
+# --- NUEVO: lookup por número de pedido (S00xxx) ---
+@app.post("/order_lookup")
+async def order_lookup(request: Request):
+    """
+    Body esperado:
+    { "order_number": "S00413" }
+
+    Respuesta:
+    {
+      "found": true/false,
+      "client_name": "...",
+      "order_number": "...",
+      "order_date": "dd/mm/YYYY HH:MM",
+      "order_total": "$ 1,950.00",
+      "mc_message": "Hola ... tu pedido ..."
+    }
+    """
+    try:
+        data = await request.json()
+        order_number = (data.get("order_number") or "").strip()
+        if not order_number:
+            return {"found": False, "mc_message": "Proporciona el número de pedido (ej. S00413)."}
+
+        # 1) Auth Odoo
+        common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
+        uid = common.authenticate(ODOO_DB, ODOO_USER, ODOO_PASSWORD, {})
+        if not uid:
+            return {"found": False, "mc_message": "❌ Error de autenticación con Odoo."}
+        models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
+
+        # 2) Buscar sale.order por name exacto
+        domain = [["name", "=", order_number]]
+        fields = ["name", "partner_id", "date_order", "amount_total"]
+        so = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD,
+            "sale.order", "search_read",
+            [domain],
+            {"fields": fields, "limit": 1}
+        )
+
+        if not so:
+            return {
+                "found": False,
+                "order_number": order_number,
+                "mc_message": f"No encontré el pedido {order_number}. Verifica el formato (ej. S00413)."
+            }
+
+        o = so[0]
+        client_name = (o.get("partner_id") or ["", ""])[1]
+        order_date  = _format_odoo_datetime(o.get("date_order"))
+        order_total = _format_money(o.get("amount_total") or 0.0)
+
+        mc_message = (
+            f"Hola {client_name}, tu pedido {o['name']} se realizó el {order_date} "
+            f"por un total de {order_total}. "
+            f"Si tienes dudas de tiempos y formas de entrega consulta nuestro apartado de Preguntas Frecuentes."
+        )
+
+        return {
+            "found": True,
+            "client_name": client_name,
+            "order_number": o["name"],
+            "order_date": order_date,
+            "order_total": order_total,
+            "mc_message": mc_message
+        }
+
+    except Exception as e:
+        return {"found": False, "mc_message": f"⚠️ Error al consultar pedido: {str(e)}"}
+
