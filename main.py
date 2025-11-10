@@ -416,3 +416,82 @@ async def order_lookup(request: Request):
 
     except Exception as e:
         return {"found": False, "mc_message": f"⚠️ Error al consultar pedido: {str(e)}"}
+
+
+@app.post("/nlp/route")
+async def nlp_route(request: Request):
+    """
+    Recibe:
+    {
+      "text": "quiero saber mi pedido",
+      "school": "edron"
+    }
+
+    Devuelve:
+    {
+      "found": true,
+      "intent": "seguimiento_pedido",
+      "school": "edron",
+      "matched_word": "pedido"
+    }
+    """
+    try:
+        data = await request.json()
+        text = (data.get("text") or "").lower().strip()
+        school = (data.get("school") or "").lower().strip()
+
+        if not text:
+            return {"found": False, "intent": None, "msg": "❌ No se recibió texto para analizar."}
+
+        # --- Conexión a Odoo ---
+        common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
+        uid = common.authenticate(ODOO_DB, ODOO_USER, ODOO_PASSWORD, {})
+        if not uid:
+            return {"found": False, "intent": None, "msg": "❌ Error autenticando en Odoo."}
+
+        models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
+
+        # --- Buscar reglas activas de la escuela o genéricas ---
+        domain = [["active", "=", True]]
+        if school:
+            domain.append(["x_school", "in", [school, False]])
+
+        rules = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD,
+            "x_chatbot_intent", "search_read",
+            [domain],
+            {"fields": ["x_school", "x_category", "x_patterns", "x_priority"], "limit": 200}
+        )
+
+        # --- Normalizar texto ---
+        import unicodedata
+        def normalize(t):
+            return ''.join(
+                c for c in unicodedata.normalize('NFD', t.lower())
+                if unicodedata.category(c) != 'Mn'
+            )
+
+        clean_text = normalize(text)
+
+        # --- Buscar coincidencia ---
+        best_match = None
+        for r in sorted(rules, key=lambda x: x.get("x_priority") or 0, reverse=True):
+            patterns = (r.get("x_patterns") or "").splitlines()
+            for p in patterns:
+                if normalize(p.strip()) in clean_text:
+                    best_match = {
+                        "intent": r.get("x_category"),
+                        "school": r.get("x_school"),
+                        "matched_word": p.strip()
+                    }
+                    break
+            if best_match:
+                break
+
+        if not best_match:
+            return {"found": False, "intent": None, "msg": "No se encontró intención."}
+
+        return {"found": True, **best_match}
+
+    except Exception as e:
+        return {"found": False, "intent": None, "msg": f"Error procesando NLP: {str(e)}"}
