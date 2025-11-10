@@ -441,18 +441,18 @@ def _load_rules(school: str):
     models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
     domain = [["active", "=", True]]
     if school:
-        domain.append(["x_school", "=", school])
+        domain.append(["x_studio_school", "=", school])
     rows = models.execute_kw(
         ODOO_DB, uid, ODOO_PASSWORD,
         "x_chatbot_intents", "search_read",
         [domain],
-        {"fields": ["x_category", "x_patterns", "x_priority"], "limit": 1000}
+        {"fields": ["x_studio_category", "x_studio_patterns", "x_studio_priority"], "limit": 1000}
     )
     rules = []
     for r in rows:
         pats = [p.strip() for p in (r.get("x_patterns") or "").splitlines() if p.strip()]
         rules.append({
-            "cat": r.get("x_category"),
+            "cat": r.get("x_studio_category"),
             "pats": [_norm(p) for p in pats],
             "prio": r.get("x_priority") or 0
         })
@@ -497,13 +497,13 @@ async def nlp_route(request: Request):
         # --- Buscar reglas activas de la escuela o genéricas ---
         domain = [["active", "=", True]]
         if school:
-            domain.append(["x_school", "in", [school, False]])
+            domain.append(["x_studio_school", "in", [school, False]])
 
         rules = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD,
             "x_chatbot_intents", "search_read",
             [domain],
-            {"fields": ["x_school", "x_category", "x_patterns", "x_priority"], "limit": 200}
+            {"fields": ["x_studio_school", "x_studio_category", "x_studio_patterns", "x_studio_priority"], "limit": 200}
         )
 
         # --- Normalizar texto ---
@@ -519,12 +519,12 @@ async def nlp_route(request: Request):
         # --- Buscar coincidencia ---
         best_match = None
         for r in sorted(rules, key=lambda x: x.get("x_priority") or 0, reverse=True):
-            patterns = (r.get("x_patterns") or "").splitlines()
+            patterns = (r.get("x_studio_patterns") or "").splitlines()
             for p in patterns:
                 if normalize(p.strip()) in clean_text:
                     best_match = {
-                        "intent": r.get("x_category"),
-                        "school": r.get("x_school"),
+                        "intent": r.get("x_studio_category"),
+                        "school": r.get("x_studio_school"),
                         "matched_word": p.strip()
                     }
                     break
