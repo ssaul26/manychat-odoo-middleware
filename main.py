@@ -3,7 +3,8 @@ import xmlrpc.client
 import os
 from collections import defaultdict, OrderedDict
 from datetime import datetime
-
+import unicodedata, time, re
+import logging
 
 app = FastAPI()
 
@@ -12,6 +13,11 @@ ODOO_URL = os.getenv("ODOO_URL")
 ODOO_DB = os.getenv("ODOO_DB")
 ODOO_USER = os.getenv("ODOO_USER")
 ODOO_PASSWORD = os.getenv("ODOO_PASSWORD")
+
+# Logger opcional para depuración
+logger = logging.getLogger("middleware")
+if not logger.handlers:
+    logging.basicConfig(level=logging.INFO)
 
 
 @app.get("/")
@@ -32,7 +38,6 @@ def get_inventario(
     - format=json  -> {"productos":[...], "next_offset": <int>}
     - format=text  -> {"catalogo_msg": "...", "next_offset": <int>}
     """
-
     try:
         # 1) Autenticación
         common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
@@ -128,7 +133,7 @@ def get_inventario(
             lineas = [
                 f"⭐ *{it.get('name') or 'Producto'}*",
                 f"💰 Precio: ${it.get('price') or 0}",
-                f"📦 {stock_label}",               # <<-- aquí el cambio de presentación
+                f"📦 {stock_label}",
             ]
             attrs = it.get("attributes") or {}
             for attr_name, values in attrs.items():
@@ -146,13 +151,9 @@ def get_inventario(
 @app.get("/faq")
 def get_faq(category: str = None, format: str = "text"):
     """
-    Devuelve FAQs con formato limpio para ManyChat:
-    - Títulos en negritas con emoji 📘
-    - Preguntas con 💬
-    - Respuestas separadas con saltos de línea
-    - Sin uso de BeautifulSoup (solo regex)
+    Devuelve FAQs con formato limpio para ManyChat (sin BeautifulSoup).
     """
-    import re, html, xmlrpc.client
+    import re, html
 
     try:
         # --- Autenticación ---
@@ -183,7 +184,7 @@ def get_faq(category: str = None, format: str = "text"):
         def clean_html(text):
             text = html.unescape(text or "")
             text = re.sub(r"<\s*br\s*/?>", "\n", text)  # <br> → salto
-            text = re.sub(r"</p\s*>", "\n\n", text)     # cierre de <p> → doble salto
+            text = re.sub(r"</p\s*>", "\n\n", text)     # </p> → doble salto
             text = re.sub(r"<[^>]+>", "", text)         # elimina etiquetas restantes
             text = text.replace("\xa0", " ")
             text = re.sub(r"\n{3,}", "\n\n", text)
@@ -193,18 +194,13 @@ def get_faq(category: str = None, format: str = "text"):
         for rec in faq_records:
             name = rec.get("name", "Preguntas Frecuentes")
             body = rec.get("body", "")
-
             texto = clean_html(body)
-
-            # --- Formato visual mejorado ---
             # Detecta preguntas (terminan con ?)
             texto = re.sub(r"([^\n]*\?)", r"\n💬 *\1*\n", texto)
             texto = re.sub(r"\n{3,}", "\n\n", texto)  # compactar saltos
-
-
             bloque = f"\n📘 *{name}*\n{texto}\n\n"
             bloques.append(bloque)
-        
+
         faq_msg = "\n".join(bloques).strip()
         return {"faq_msg": faq_msg, "total": len(bloques)}
 
@@ -230,6 +226,7 @@ def normalize_datetime(s: str | None) -> str:
         except Exception:
             continue
     return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
 
 @app.post("/register_interaction")
 async def register_interaction(request: Request):
@@ -265,7 +262,6 @@ async def register_interaction(request: Request):
         }
 
         # 3) DEDUPE / UPSERT
-        # Regla: buscar por messenger_id; si no hay, intenta por correo; si no por teléfono.
         domain = []
         if messenger_id:
             domain = [["x_studio_messeger_id", "=", messenger_id]]
@@ -283,7 +279,6 @@ async def register_interaction(request: Request):
             )
 
         if existing_ids:
-            # update (write)
             models.execute_kw(
                 ODOO_DB, uid, ODOO_PASSWORD,
                 "x_interacciones_chatbo", "write",
@@ -292,7 +287,6 @@ async def register_interaction(request: Request):
             rec_id = existing_ids[0]
             action = "updated"
         else:
-            # create
             rec_id = models.execute_kw(
                 ODOO_DB, uid, ODOO_PASSWORD,
                 "x_interacciones_chatbo", "create",
@@ -328,9 +322,9 @@ def _format_odoo_datetime(s: str | None) -> str:
             continue
     return s  # si no se pudo parsear, regresa crudo
 
+
 @app.post("/order_lookup")
 async def order_lookup(request: Request):
-
     try:
         data = await request.json()
         order_number = (data.get("order_number") or "").strip()
@@ -370,7 +364,7 @@ async def order_lookup(request: Request):
         order_date = _format_odoo_datetime(o.get("date_order"))
         order_total = _format_money(o.get("amount_total") or 0.0)
 
-        # 3) Mensaje formateado con emojis y saltos de línea
+        # 3) Mensaje formateado
         mc_message = (
             f"👋 ¡Hola {client_name}!\n\n"
             f"📦 Tu pedido *{o['name']}* se realizó el 🗓️ {order_date} "
@@ -393,7 +387,7 @@ async def order_lookup(request: Request):
         return {"found": False, "mc_message": f"⚠️ Error al consultar pedido: {str(e)}"}
 
 
-import unicodedata, time, re
+# ======== INTENT RULES Y NLP ========
 
 _INTENT_CACHE = {}          # cache por escuela
 _INTENT_CACHE_TTL = 300     # 5 minutos
@@ -404,6 +398,10 @@ def _norm(s: str) -> str:
 
 
 def _load_rules(school: str):
+    """
+    Lee reglas desde Odoo, filtra por escuela (ilike si viene) y hace fallback a reglas genéricas.
+    Parsea patrones por líneas y comas. Cachea por 5 min.
+    """
     now = time.time()
     key = school or "_all"
     if key in _INTENT_CACHE and now - _INTENT_CACHE[key]["ts"] < _INTENT_CACHE_TTL:
@@ -458,60 +456,38 @@ def _load_rules(school: str):
     return rules
 
 
-# ----- endpoint /nlp/route -----
 @app.post("/nlp/route")
 async def nlp_route(request: Request):
+    """
+    Versión corregida: usa _load_rules (maneja 'ilike' por escuela y fallback),
+    normaliza texto y patrones, y matchea por substring respetando prioridad.
+    """
     try:
         data = await request.json()
-        text = (data.get("text") or "").lower().strip()
-        school = (data.get("school") or "").lower().strip()
+        text = (data.get("text") or "").strip()
+        school = (data.get("school") or "").strip()
 
         if not text:
             return {"found": False, "intent": None, "msg": "❌ No se recibió texto para analizar."}
 
-        common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
-        uid = common.authenticate(ODOO_DB, ODOO_USER, ODOO_PASSWORD, {})
-        if not uid:
-            return {"found": False, "intent": None, "msg": "❌ Error autenticando en Odoo."}
+        clean_text = _norm(text)
+        rules = _load_rules(school)
 
-        models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
+        if not rules:
+            return {"found": False, "intent": None, "msg": "⚠️ No hay reglas configuradas en Odoo."}
 
-        domain = []      # quita active si no existe en tu modelo
-        # domain = [["active", "=", True]]
-        if school:
-            domain.append(["x_studio_school", "in", [school, False]])
-
-        rules = models.execute_kw(
-            ODOO_DB, uid, ODOO_PASSWORD,
-            "x_chatbot_intents", "search_read",
-            [domain],
-            {"fields": ["x_studio_school", "x_studio_category", "x_studio_patterns", "x_studio_priority"], "limit": 200}
-        )
-
-        def normalize(t):
-            return ''.join(c for c in unicodedata.normalize('NFD', t.lower())
-                           if unicodedata.category(c) != 'Mn')
-
-        clean_text = normalize(text)
-
-        best_match = None
-        for r in sorted(rules, key=lambda x: x.get("x_studio_priority") or 0, reverse=True):
-            patterns = (r.get("x_studio_patterns") or "").splitlines()
-            for p in patterns:
-                if normalize(p.strip()) in clean_text:
-                    best_match = {
-                        "intent": r.get("x_studio_category"),
-                        "school": r.get("x_studio_school"),
-                        "matched_word": p.strip()
+        for r in rules:  # ya vienen ordenadas por prioridad desc
+            for pat in r["pats"]:
+                if pat and pat in clean_text:
+                    return {
+                        "found": True,
+                        "intent": r["cat"],
+                        "matched_word": pat,
+                        "school": school or None
                     }
-                    break
-            if best_match:
-                break
 
-        if not best_match:
-            return {"found": False, "intent": None, "msg": "No se encontró intención."}
-
-        return {"found": True, **best_match}
+        return {"found": False, "intent": None, "msg": "No se encontró intención."}
 
     except Exception as e:
+        logger.exception("Error en /nlp/route")
         return {"found": False, "intent": None, "msg": f"Error procesando NLP: {str(e)}"}
