@@ -427,6 +427,7 @@ def _norm(s: str) -> str:
     s = (s or "").lower().strip()
     return ''.join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn")
 
+# ----- helpers intents -----
 def _load_rules(school: str):
     now = time.time()
     key = school or "_all"
@@ -439,45 +440,36 @@ def _load_rules(school: str):
         return []
 
     models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
-    domain = [["active", "=", True]]
+
+    domain = []                      # quita active si no existe el campo en tu modelo
+    # domain = [["active", "=", True]]
     if school:
         domain.append(["x_studio_school", "=", school])
+
     rows = models.execute_kw(
         ODOO_DB, uid, ODOO_PASSWORD,
         "x_chatbot_intents", "search_read",
         [domain],
         {"fields": ["x_studio_category", "x_studio_patterns", "x_studio_priority"], "limit": 1000}
     )
+
     rules = []
     for r in rows:
-        pats = [p.strip() for p in (r.get("x_patterns") or "").splitlines() if p.strip()]
+        pats_raw = r.get("x_studio_patterns") or ""
+        pats = [p.strip() for p in pats_raw.splitlines() if p.strip()]
         rules.append({
-            "cat": r.get("x_studio_category"),
+            "cat":  r.get("x_studio_category"),
             "pats": [_norm(p) for p in pats],
-            "prio": r.get("x_priority") or 0
+            "prio": r.get("x_studio_priority") or 0,
         })
+
     rules.sort(key=lambda z: z["prio"], reverse=True)
     _INTENT_CACHE[key] = {"ts": now, "rules": rules}
     return rules
 
-
+# ----- endpoint /nlp/route -----
 @app.post("/nlp/route")
 async def nlp_route(request: Request):
-    """
-    Recibe:
-    {
-      "text": "quiero saber mi pedido",
-      "school": "edron"
-    }
-
-    Devuelve:
-    {
-      "found": true,
-      "intent": "seguimiento_pedido",
-      "school": "edron",
-      "matched_word": "pedido"
-    }
-    """
     try:
         data = await request.json()
         text = (data.get("text") or "").lower().strip()
@@ -486,7 +478,6 @@ async def nlp_route(request: Request):
         if not text:
             return {"found": False, "intent": None, "msg": "❌ No se recibió texto para analizar."}
 
-        # --- Conexión a Odoo ---
         common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
         uid = common.authenticate(ODOO_DB, ODOO_USER, ODOO_PASSWORD, {})
         if not uid:
@@ -494,8 +485,8 @@ async def nlp_route(request: Request):
 
         models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
 
-        # --- Buscar reglas activas de la escuela o genéricas ---
-        domain = [["active", "=", True]]
+        domain = []      # quita active si no existe en tu modelo
+        # domain = [["active", "=", True]]
         if school:
             domain.append(["x_studio_school", "in", [school, False]])
 
@@ -506,19 +497,14 @@ async def nlp_route(request: Request):
             {"fields": ["x_studio_school", "x_studio_category", "x_studio_patterns", "x_studio_priority"], "limit": 200}
         )
 
-        # --- Normalizar texto ---
-        import unicodedata
         def normalize(t):
-            return ''.join(
-                c for c in unicodedata.normalize('NFD', t.lower())
-                if unicodedata.category(c) != 'Mn'
-            )
+            return ''.join(c for c in unicodedata.normalize('NFD', t.lower())
+                           if unicodedata.category(c) != 'Mn')
 
         clean_text = normalize(text)
 
-        # --- Buscar coincidencia ---
         best_match = None
-        for r in sorted(rules, key=lambda x: x.get("x_priority") or 0, reverse=True):
+        for r in sorted(rules, key=lambda x: x.get("x_studio_priority") or 0, reverse=True):
             patterns = (r.get("x_studio_patterns") or "").splitlines()
             for p in patterns:
                 if normalize(p.strip()) in clean_text:
