@@ -211,31 +211,6 @@ def get_faq(category: str = None, format: str = "text"):
     except Exception as e:
         return {"faq_msg": f"⚠️ Error al procesar las FAQ: {str(e)}"}
 
-def normalize_datetime(s: str | None) -> str:
-    if not s:
-        return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-
-    # Intenta varios formatos (incluye el de ManyChat: '20 Oct 2025, 05:41pm')
-    for parser in (
-        lambda x: datetime.fromisoformat(x.replace("Z", "+00:00")),        # ISO
-        lambda x: datetime.strptime(x, "%d %b %Y, %I:%M%p"),               # 20 Oct 2025, 05:41pm
-        lambda x: datetime.strptime(x, "%d %B %Y, %I:%M%p"),               # 20 October 2025, 05:41pm
-        lambda x: datetime.strptime(x, "%Y-%m-%d %H:%M:%S"),               # 2025-10-20 17:41:00
-        lambda x: datetime.strptime(x, "%Y-%m-%dT%H:%M:%S.%f"),            # 2025-10-20T17:41:00.123456
-        lambda x: datetime.strptime(x, "%Y-%m-%dT%H:%M:%S"),               # 2025-10-20T17:41:00
-    ):
-        try:
-            dt = parser(s)
-            return dt.strftime("%Y-%m-%d %H:%M:%S")
-        except Exception:
-            continue
-    # Respaldo
-    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-
-from fastapi import FastAPI, Request
-import xmlrpc.client, os
-from datetime import datetime
-
 
 def normalize_datetime(s: str | None) -> str:
     if not s:
