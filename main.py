@@ -427,13 +427,14 @@ def _norm(s: str) -> str:
     s = (s or "").lower().strip()
     return ''.join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn")
 
-# ----- helpers intents -----
+
 def _load_rules(school: str):
     now = time.time()
     key = school or "_all"
     if key in _INTENT_CACHE and now - _INTENT_CACHE[key]["ts"] < _INTENT_CACHE_TTL:
         return _INTENT_CACHE[key]["rules"]
 
+    # --- Auth Odoo ---
     common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
     uid = common.authenticate(ODOO_DB, ODOO_USER, ODOO_PASSWORD, {})
     if not uid:
@@ -441,10 +442,10 @@ def _load_rules(school: str):
 
     models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
 
-    domain = []                      # quita active si no existe el campo en tu modelo
-    # domain = [["active", "=", True]]
+    # --- Dominio por escuela (case-insensitive); sin 'active' para evitar errores si no existe el campo
+    domain = []
     if school:
-        domain.append(["x_studio_school", "=", school])
+        domain.append(["x_studio_school", "ilike", school])
 
     rows = models.execute_kw(
         ODOO_DB, uid, ODOO_PASSWORD,
@@ -453,10 +454,24 @@ def _load_rules(school: str):
         {"fields": ["x_studio_category", "x_studio_patterns", "x_studio_priority"], "limit": 1000}
     )
 
+    # Fallback a reglas genéricas (sin escuela) si no encontró por escuela
+    if not rows:
+        rows = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD,
+            "x_chatbot_intents", "search_read",
+            [[["x_studio_school", "=", False]]],
+            {"fields": ["x_studio_category", "x_studio_patterns", "x_studio_priority"], "limit": 1000}
+        )
+
+    # --- Normalización de reglas
     rules = []
     for r in rows:
-        pats_raw = r.get("x_studio_patterns") or ""
-        pats = [p.strip() for p in pats_raw.splitlines() if p.strip()]
+        raw = (r.get("x_studio_patterns") or "").strip()
+        # Soporta líneas y/o comas como separadores
+        pats = []
+        for line in raw.splitlines():
+            pats.extend([p.strip() for p in line.split(",") if p.strip()])
+
         rules.append({
             "cat":  r.get("x_studio_category"),
             "pats": [_norm(p) for p in pats],
@@ -466,6 +481,7 @@ def _load_rules(school: str):
     rules.sort(key=lambda z: z["prio"], reverse=True)
     _INTENT_CACHE[key] = {"ts": now, "rules": rules}
     return rules
+
 
 # ----- endpoint /nlp/route -----
 @app.post("/nlp/route")
