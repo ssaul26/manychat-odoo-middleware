@@ -444,7 +444,7 @@ def _load_rules(school: str):
         domain.append(["x_school", "=", school])
     rows = models.execute_kw(
         ODOO_DB, uid, ODOO_PASSWORD,
-        "x_chatbot_intent", "search_read",
+        "x_chatbot_intents", "search_read",
         [domain],
         {"fields": ["x_category", "x_patterns", "x_priority"], "limit": 1000}
     )
@@ -501,7 +501,7 @@ async def nlp_route(request: Request):
 
         rules = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD,
-            "x_chatbot_intent", "search_read",
+            "x_chatbot_intents", "search_read",
             [domain],
             {"fields": ["x_school", "x_category", "x_patterns", "x_priority"], "limit": 200}
         )
