@@ -418,6 +418,49 @@ async def order_lookup(request: Request):
         return {"found": False, "mc_message": f"⚠️ Error al consultar pedido: {str(e)}"}
 
 
+import unicodedata, time, re
+
+_INTENT_CACHE = {}          # cache por escuela
+_INTENT_CACHE_TTL = 300     # 5 minutos
+
+def _norm(s: str) -> str:
+    s = (s or "").lower().strip()
+    return ''.join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn")
+
+def _load_rules(school: str):
+    now = time.time()
+    key = school or "_all"
+    if key in _INTENT_CACHE and now - _INTENT_CACHE[key]["ts"] < _INTENT_CACHE_TTL:
+        return _INTENT_CACHE[key]["rules"]
+
+    common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
+    uid = common.authenticate(ODOO_DB, ODOO_USER, ODOO_PASSWORD, {})
+    if not uid:
+        return []
+
+    models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
+    domain = [["active", "=", True]]
+    if school:
+        domain.append(["x_school", "=", school])
+    rows = models.execute_kw(
+        ODOO_DB, uid, ODOO_PASSWORD,
+        "x_chatbot_intent", "search_read",
+        [domain],
+        {"fields": ["x_category", "x_patterns", "x_priority"], "limit": 1000}
+    )
+    rules = []
+    for r in rows:
+        pats = [p.strip() for p in (r.get("x_patterns") or "").splitlines() if p.strip()]
+        rules.append({
+            "cat": r.get("x_category"),
+            "pats": [_norm(p) for p in pats],
+            "prio": r.get("x_priority") or 0
+        })
+    rules.sort(key=lambda z: z["prio"], reverse=True)
+    _INTENT_CACHE[key] = {"ts": now, "rules": rules}
+    return rules
+
+
 @app.post("/nlp/route")
 async def nlp_route(request: Request):
     """
