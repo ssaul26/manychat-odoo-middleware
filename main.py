@@ -198,7 +198,7 @@ def get_faq(category: str = None, format: str = "text"):
             # Detecta preguntas (terminan con ?)
             texto = re.sub(r"([^\n]*\?)", r"\n💬 *\1*\n", texto)
             texto = re.sub(r"\n{3,}", "\n\n", texto)  # compactar saltos
-            bloque = f"\n📘 *{name}*\n{texto}\n\n"
+            bloque = f"\n{texto}\n\n"
             bloques.append(bloque)
 
         faq_msg = "\n".join(bloques).strip()
