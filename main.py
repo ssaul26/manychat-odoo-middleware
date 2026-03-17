@@ -402,12 +402,12 @@ async def order_lookup(request: Request):
 
         mc_message = (
             f"👋 ¡Hola {client_name}!\n\n"
-            f"📦 Tu pedido *{o['name']}* se realizó el 🗓️ {order_date} "
-            f"por un total de 💰 *{order_total}*.\n\n"
-            f"🏷️ Estado Sporthouse: *{estado_txt}*\n\n"
+            f"📦 Tu pedido *{o['name']}* se realizó el {order_date} "
+            f"por un total de *{order_total}*.\n\n"
+            f"🏷️ Estatus actual: *{estado_txt}*\n\n"
             f"🚚 Si tienes dudas sobre tiempos o formas de entrega, "
-            f"consulta nuestro apartado de *Preguntas Frecuentes* 📘.\n\n"
-            f"Gracias por tu compra con *Sporthouse*! 💪"
+            f"consulta nuestro apartado de *Preguntas Frecuentes*.\n\n"
+            f"Gracias por tu compra con *Sporthouse*!"
         )
 
         return {
