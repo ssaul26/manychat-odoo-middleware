@@ -407,7 +407,7 @@ async def order_lookup(request: Request):
             f"🏷️ Estatus actual: *{estado_txt}*\n\n"
             f"🚚 Si tienes dudas sobre tiempos o formas de entrega, "
             f"consulta nuestro apartado de *Preguntas Frecuentes*.\n\n"
-            f"Gracias por tu compra con *Sporthouse*!"
+            f"¡Gracias por tu compra con *Sporthouse*!"
         )
 
         return {
