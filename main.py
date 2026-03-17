@@ -364,11 +364,47 @@ async def order_lookup(request: Request):
         order_date = _format_odoo_datetime(o.get("date_order"))
         order_total = _format_money(o.get("amount_total") or 0.0)
 
-        # 3) Mensaje formateado
+        # 3) Buscar el stock.picking relacionado
+        picking_domain = [
+            ["origin", "=", o["name"]]
+        ]
+        picking_fields = [
+            "name",
+            "origin",
+            "state",
+            "scheduled_date",
+            "x_studio_estado_sporthouse"
+        ]
+
+        pickings = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD,
+            "stock.picking", "search_read",
+            [picking_domain],
+            {
+                "fields": picking_fields,
+                "limit": 1,
+                "order": "id desc"
+            }
+        )
+
+        sporthouse_status = ""
+        picking_name = ""
+        picking_state = ""
+
+        if pickings:
+            p = pickings[0]
+            sporthouse_status = p.get("x_studio_estado_sporthouse") or ""
+            picking_name = p.get("name") or ""
+            picking_state = p.get("state") or ""
+
+        # 4) Mensaje formateado
+        estado_txt = sporthouse_status if sporthouse_status else "Sin estatus disponible"
+
         mc_message = (
             f"👋 ¡Hola {client_name}!\n\n"
             f"📦 Tu pedido *{o['name']}* se realizó el 🗓️ {order_date} "
             f"por un total de 💰 *{order_total}*.\n\n"
+            f"🏷️ Estado Sporthouse: *{estado_txt}*\n\n"
             f"🚚 Si tienes dudas sobre tiempos o formas de entrega, "
             f"consulta nuestro apartado de *Preguntas Frecuentes* 📘.\n\n"
             f"Gracias por tu compra con *Sporthouse*! 💪"
@@ -380,12 +416,14 @@ async def order_lookup(request: Request):
             "order_number": o["name"],
             "order_date": order_date,
             "order_total": order_total,
+            "sporthouse_status": sporthouse_status,
+            "picking_name": picking_name,
+            "picking_state": picking_state,
             "mc_message": mc_message
         }
 
     except Exception as e:
         return {"found": False, "mc_message": f"⚠️ Error al consultar pedido: {str(e)}"}
-
 
 # ======== INTENT RULES Y NLP ========
 
