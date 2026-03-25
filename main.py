@@ -535,37 +535,46 @@ MANYCHAT_API_KEY = "2663902:a54d0232e6fc431174e20594d5679c93"
 
 
 @app.post("/send_whatsapp")
-def send_whatsapp(data: dict):
-    phone = data.get("phone")
-    name = data.get("name")
-    order_number = data.get("order_number")
-    status = data.get("status")
+async def send_whatsapp(request: Request):
+    try:
+        data = await request.json()
 
-    url = "https://api.manychat.com/fb/subscriber/createSubscriber"
+        phone = data.get("phone")
+        name = data.get("name")
+        order_number = data.get("order_number")
+        status = data.get("status")
 
-    headers = {
-        "Authorization": f"Bearer {MANYCHAT_API_KEY}",
-        "Content-Type": "application/json"
-    }
+        url = "https://api.manychat.com/fb/subscriber/createSubscriber"
 
-    payload = {
-        "whatsapp_phone": phone,
-        "first_name": name,
-        "custom_fields": [
-            {
-                "name": "odoo_order_number",
-                "value": order_number
-            },
-            {
-                "name": "odoo_status_sporthouse",
-                "value": status
-            }
-        ]
-    }
+        headers = {
+            "Authorization": f"Bearer {MANYCHAT_API_KEY}",
+            "Content-Type": "application/json"
+        }
 
-    response = requests.post(url, json=payload, headers=headers)
+        payload = {
+            "whatsapp_phone": phone,
+            "first_name": name,
+            "custom_fields": [
+                {
+                    "name": "odoo_order_number",
+                    "value": order_number
+                },
+                {
+                    "name": "odoo_status_sporthouse",
+                    "value": status
+                }
+            ]
+        }
 
-    return {
-        "status_code": response.status_code,
-        "response": response.json()
-    }
+        response = requests.post(url, json=payload, headers=headers)
+
+        return {
+            "received": data,
+            "manychat_status": response.status_code,
+            "manychat_response": response.text
+        }
+
+    except Exception as e:
+        return {
+            "error": str(e)
+        }
