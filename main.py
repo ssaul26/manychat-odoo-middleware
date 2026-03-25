@@ -614,3 +614,47 @@ async def send_whatsapp(request: Request):
     except Exception as e:
         return {"error": str(e)}
 
+@app.post("/update_whatsapp_fields")
+async def update_whatsapp_fields(request: Request):
+    try:
+        data = await request.json()
+
+        subscriber_id = data.get("subscriber_id")
+        order_number = data.get("order_number")
+        status = data.get("status")
+
+        if not subscriber_id:
+            return {"error": "Falta subscriber_id"}
+
+        set_field_url = "https://api.manychat.com/fb/subscriber/setCustomFieldByName"
+
+        r1 = requests.post(
+            set_field_url,
+            json={
+                "subscriber_id": subscriber_id,
+                "field_name": "odoo_order_number",
+                "field_value": order_number
+            },
+            headers=HEADERS
+        )
+
+        r2 = requests.post(
+            set_field_url,
+            json={
+                "subscriber_id": subscriber_id,
+                "field_name": "odoo_status_sporthouse",
+                "field_value": status
+            },
+            headers=HEADERS
+        )
+
+        return {
+            "order_update_status": r1.status_code,
+            "order_update_response": r1.text,
+            "status_update_status": r2.status_code,
+            "status_update_response": r2.text
+        }
+
+    except Exception as e:
+        return {"error": str(e)}
+
