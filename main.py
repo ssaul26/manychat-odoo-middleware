@@ -534,8 +534,6 @@ async def nlp_route(request: Request):
 
 MANYCHAT_API_KEY = "2663902:a54d0232e6fc431174e20594d5679c93"
 
-BASE_URL = "https://api.manychat.com"
-
 headers = {
     "Authorization": f"Bearer {MANYCHAT_API_KEY}",
     "Content-Type": "application/json"
@@ -551,33 +549,30 @@ async def send_whatsapp(request: Request):
         order_number = data.get("order_number")
         status = data.get("status")
 
-        # 1. Intentar crear contacto (si no existe)
+        # 1. Crear contacto
         create_url = "https://api.manychat.com/fb/subscriber/createSubscriber"
 
         create_payload = {
-            "phone": phone,
+            "whatsapp_phone": phone,
             "first_name": name
         }
 
         create_response = requests.post(create_url, json=create_payload, headers=headers)
 
-        # 2. Obtener subscriber_id SI se puede
         subscriber_id = None
+
         try:
             create_json = create_response.json()
-            subscriber_id = (
-                create_json.get("data", {}).get("id")
-                or create_json.get("data", {}).get("subscriber_id")
-            )
+            subscriber_id = create_json.get("data", {}).get("id")
         except:
             pass
 
-        # 🔥 SI NO VIENE subscriber_id (contacto ya existe)
+        # 2. Si no existe, buscarlo
         if not subscriber_id:
-            # buscar contacto por teléfono
             find_url = "https://api.manychat.com/fb/subscriber/findBySystemField"
+
             find_payload = {
-                "field_name": "phone",
+                "field_name": "whatsapp_phone",
                 "field_value": phone
             }
 
@@ -586,7 +581,17 @@ async def send_whatsapp(request: Request):
 
             subscriber_id = find_json.get("data", {}).get("id")
 
-        # 3. Actualizar campos (SIEMPRE)
+        # 🔥 VALIDACIÓN CLAVE
+        if not subscriber_id:
+            return {
+                "error": "No se pudo encontrar ni crear el contacto",
+                "debug": {
+                    "create": create_response.text,
+                    "find": find_json
+                }
+            }
+
+        # 3. Guardar campos
         set_field_url = "https://api.manychat.com/fb/subscriber/setCustomFieldByName"
 
         requests.post(set_field_url, json={
@@ -608,3 +613,4 @@ async def send_whatsapp(request: Request):
 
     except Exception as e:
         return {"error": str(e)}
+
