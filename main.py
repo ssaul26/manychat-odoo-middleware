@@ -5,6 +5,7 @@ from collections import defaultdict, OrderedDict
 from datetime import datetime
 import unicodedata, time, re
 import logging
+import requests
 
 app = FastAPI()
 
