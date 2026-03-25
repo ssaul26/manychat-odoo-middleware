@@ -539,6 +539,11 @@ headers = {
     "Content-Type": "application/json"
 }
 
+HEADERS = {
+    "Authorization": f"Bearer {MANYCHAT_API_KEY}",
+    "Content-Type": "application/json"
+}
+
 @app.post("/send_whatsapp")
 async def send_whatsapp(request: Request):
     try:
