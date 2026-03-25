@@ -529,3 +529,43 @@ async def nlp_route(request: Request):
     except Exception as e:
         logger.exception("Error en /nlp/route")
         return {"found": False, "intent": None, "msg": f"Error procesando NLP: {str(e)}"}
+        
+
+MANYCHAT_API_KEY = "2663902:a54d0232e6fc431174e20594d5679c93"
+
+
+@app.post("/send_whatsapp")
+def send_whatsapp(data: dict):
+    phone = data.get("phone")
+    name = data.get("name")
+    order_number = data.get("order_number")
+    status = data.get("status")
+
+    url = "https://api.manychat.com/fb/subscriber/createSubscriber"
+
+    headers = {
+        "Authorization": f"Bearer {MANYCHAT_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "whatsapp_phone": phone,
+        "first_name": name,
+        "custom_fields": [
+            {
+                "name": "odoo_order_number",
+                "value": order_number
+            },
+            {
+                "name": "odoo_status_sporthouse",
+                "value": status
+            }
+        ]
+    }
+
+    response = requests.post(url, json=payload, headers=headers)
+
+    return {
+        "status_code": response.status_code,
+        "response": response.json()
+    }
