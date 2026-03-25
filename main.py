@@ -534,6 +534,12 @@ async def nlp_route(request: Request):
 
 MANYCHAT_API_KEY = "2663902:a54d0232e6fc431174e20594d5679c93"
 
+BASE_URL = "https://api.manychat.com"
+
+headers = {
+    "Authorization": f"Bearer {MANYCHAT_API_KEY}",
+    "Content-Type": "application/json"
+}
 
 @app.post("/send_whatsapp")
 async def send_whatsapp(request: Request):
@@ -545,37 +551,60 @@ async def send_whatsapp(request: Request):
         order_number = data.get("order_number")
         status = data.get("status")
 
-        url = "https://api.manychat.com/fb/subscriber/createSubscriber"
+        # 1. Intentar crear contacto (si no existe)
+        create_url = "https://api.manychat.com/fb/subscriber/createSubscriber"
 
-        headers = {
-            "Authorization": f"Bearer {MANYCHAT_API_KEY}",
-            "Content-Type": "application/json"
+        create_payload = {
+            "phone": phone,
+            "first_name": name
         }
 
-        payload = {
-            "whatsapp_phone": phone,
-            "first_name": name,
-            "custom_fields": [
-                {
-                    "name": "odoo_order_number",
-                    "value": order_number
-                },
-                {
-                    "name": "odoo_status_sporthouse",
-                    "value": status
-                }
-            ]
-        }
+        create_response = requests.post(create_url, json=create_payload, headers=headers)
 
-        response = requests.post(url, json=payload, headers=headers)
+        # 2. Obtener subscriber_id SI se puede
+        subscriber_id = None
+        try:
+            create_json = create_response.json()
+            subscriber_id = (
+                create_json.get("data", {}).get("id")
+                or create_json.get("data", {}).get("subscriber_id")
+            )
+        except:
+            pass
+
+        # 🔥 SI NO VIENE subscriber_id (contacto ya existe)
+        if not subscriber_id:
+            # buscar contacto por teléfono
+            find_url = "https://api.manychat.com/fb/subscriber/findBySystemField"
+            find_payload = {
+                "field_name": "phone",
+                "field_value": phone
+            }
+
+            find_response = requests.post(find_url, json=find_payload, headers=headers)
+            find_json = find_response.json()
+
+            subscriber_id = find_json.get("data", {}).get("id")
+
+        # 3. Actualizar campos (SIEMPRE)
+        set_field_url = "https://api.manychat.com/fb/subscriber/setCustomFieldByName"
+
+        requests.post(set_field_url, json={
+            "subscriber_id": subscriber_id,
+            "field_name": "odoo_order_number",
+            "field_value": order_number
+        }, headers=headers)
+
+        requests.post(set_field_url, json={
+            "subscriber_id": subscriber_id,
+            "field_name": "odoo_status_sporthouse",
+            "field_value": status
+        }, headers=headers)
 
         return {
-            "received": data,
-            "manychat_status": response.status_code,
-            "manychat_response": response.text
+            "subscriber_id": subscriber_id,
+            "status": "ok"
         }
 
     except Exception as e:
-        return {
-            "error": str(e)
-        }
+        return {"error": str(e)}
