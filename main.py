@@ -663,3 +663,424 @@ async def update_whatsapp_fields(request: Request):
     except Exception as e:
         return {"error": str(e)}
 
+
+# ============================================================
+# ETIQUETAR CONTACTOS DE MONTEVERDE EN MANYCHAT
+# ============================================================
+
+MONTEVERDE_TAG = "Colegio - Monteverde"
+
+
+def normalize_mexican_phone(phone):
+    """
+    Convierte el teléfono de Odoo a posibles formatos
+    utilizados por WhatsApp y ManyChat.
+    """
+    digits = re.sub(r"\D", "", phone or "")
+
+    if not digits:
+        return []
+
+    candidates = []
+
+    # Ejemplo: 5512345678
+    if len(digits) == 10:
+        candidates.append(f"+52{digits}")
+        candidates.append(f"+521{digits}")
+
+    # Ejemplo: 525512345678
+    elif len(digits) == 12 and digits.startswith("52"):
+        candidates.append(f"+{digits}")
+        candidates.append(f"+521{digits[-10:]}")
+
+    # Ejemplo: 5215512345678
+    elif len(digits) == 13 and digits.startswith("521"):
+        candidates.append(f"+{digits}")
+        candidates.append(f"+52{digits[-10:]}")
+
+    else:
+        candidates.append(f"+{digits}")
+
+    return list(dict.fromkeys(candidates))
+
+
+def find_manychat_contact(phone):
+    """
+    Busca un contacto existente en ManyChat.
+    No crea contactos nuevos.
+    """
+    url = (
+        "https://api.manychat.com/"
+        "fb/subscriber/findBySystemField"
+    )
+
+    attempted_phones = []
+
+    for formatted_phone in normalize_mexican_phone(phone):
+        attempted_phones.append(formatted_phone)
+
+        response = requests.post(
+            url,
+            json={
+                "field_name": "whatsapp_phone",
+                "field_value": formatted_phone
+            },
+            headers=HEADERS,
+            timeout=20
+        )
+
+        try:
+            response_data = response.json()
+        except Exception:
+            continue
+
+        subscriber_id = (
+            response_data
+            .get("data", {})
+            .get("id")
+        )
+
+        if subscriber_id:
+            return {
+                "subscriber_id": subscriber_id,
+                "matched_phone": formatted_phone,
+                "attempted_phones": attempted_phones
+            }
+
+    return {
+        "subscriber_id": None,
+        "matched_phone": None,
+        "attempted_phones": attempted_phones
+    }
+
+
+def add_manychat_tag(subscriber_id):
+    """
+    Agrega la etiqueta Colegio - Monteverde.
+    """
+    url = (
+        "https://api.manychat.com/"
+        "fb/subscriber/addTagByName"
+    )
+
+    response = requests.post(
+        url,
+        json={
+            "subscriber_id": int(subscriber_id),
+            "tag_name": MONTEVERDE_TAG
+        },
+        headers=HEADERS,
+        timeout=20
+    )
+
+    try:
+        response_data = response.json()
+    except Exception:
+        response_data = {
+            "raw_response": response.text
+        }
+
+    if not response.ok:
+        raise Exception(
+            f"Error ManyChat {response.status_code}: "
+            f"{response.text}"
+        )
+
+    return response_data
+
+
+@app.post("/tag_monteverde")
+async def tag_monteverde(request: Request):
+    """
+    Busca los clientes con pedidos del sitio Monteverde
+    y les agrega una etiqueta en ManyChat.
+
+    JSON opcional:
+    {
+        "order_id": 123
+    }
+
+    Si no se manda order_id, revisa todos los pedidos históricos.
+    """
+    try:
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+
+        order_id = data.get("order_id") or data.get("id")
+
+        # 1. Conectarse a Odoo
+        common = xmlrpc.client.ServerProxy(
+            f"{ODOO_URL}/xmlrpc/2/common"
+        )
+
+        uid = common.authenticate(
+            ODOO_DB,
+            ODOO_USER,
+            ODOO_PASSWORD,
+            {}
+        )
+
+        if not uid:
+            return {
+                "status": "error",
+                "message": "No se pudo autenticar con Odoo."
+            }
+
+        models = xmlrpc.client.ServerProxy(
+            f"{ODOO_URL}/xmlrpc/2/object"
+        )
+
+        # ----------------------------------------------------
+        # Si se recibió un pedido específico
+        # ----------------------------------------------------
+        if order_id:
+            try:
+                order_id = int(order_id)
+            except Exception:
+                return {
+                    "status": "error",
+                    "message": "El order_id no es válido."
+                }
+
+            orders = models.execute_kw(
+                ODOO_DB,
+                uid,
+                ODOO_PASSWORD,
+                "sale.order",
+                "search_read",
+                [[
+                    ["id", "=", order_id],
+                    ["state", "!=", "cancel"]
+                ]],
+                {
+                    "fields": [
+                        "id",
+                        "name",
+                        "partner_id",
+                        "website_id"
+                    ],
+                    "limit": 1
+                }
+            )
+
+            if not orders:
+                return {
+                    "status": "not_found",
+                    "message": "No se encontró el pedido."
+                }
+
+            website = orders[0].get("website_id")
+            website_name = website[1] if website else ""
+
+            if "monteverde" not in _norm(website_name):
+                return {
+                    "status": "skipped",
+                    "message": "El pedido no pertenece a Monteverde.",
+                    "order": orders[0].get("name"),
+                    "website": website_name
+                }
+
+        # ----------------------------------------------------
+        # Si no se recibió pedido, buscar todos los históricos
+        # ----------------------------------------------------
+        else:
+            websites = models.execute_kw(
+                ODOO_DB,
+                uid,
+                ODOO_PASSWORD,
+                "website",
+                "search_read",
+                [[
+                    ["name", "ilike", "Monteverde"]
+                ]],
+                {
+                    "fields": ["id", "name"],
+                    "limit": 20
+                }
+            )
+
+            if not websites:
+                return {
+                    "status": "not_found",
+                    "message": (
+                        "No se encontró un sitio web de Odoo "
+                        "con la palabra Monteverde."
+                    )
+                }
+
+            website_ids = [
+                website["id"]
+                for website in websites
+            ]
+
+            orders = models.execute_kw(
+                ODOO_DB,
+                uid,
+                ODOO_PASSWORD,
+                "sale.order",
+                "search_read",
+                [[
+                    ["website_id", "in", website_ids],
+                    ["state", "!=", "cancel"]
+                ]],
+                {
+                    "fields": [
+                        "id",
+                        "name",
+                        "partner_id",
+                        "website_id"
+                    ],
+                    "limit": 5000,
+                    "order": "id desc"
+                }
+            )
+
+        if not orders:
+            return {
+                "status": "completed",
+                "orders_found": 0,
+                "unique_clients": 0,
+                "tagged": 0
+            }
+
+        # 2. Sacar clientes sin repetirlos
+        partner_ids = list({
+            order["partner_id"][0]
+            for order in orders
+            if order.get("partner_id")
+        })
+
+        if not partner_ids:
+            return {
+                "status": "completed",
+                "orders_found": len(orders),
+                "unique_clients": 0,
+                "tagged": 0
+            }
+
+        # 3. Consultar datos de los clientes
+        partners = models.execute_kw(
+            ODOO_DB,
+            uid,
+            ODOO_PASSWORD,
+            "res.partner",
+            "search_read",
+            [[
+                ["id", "in", partner_ids]
+            ]],
+            {
+                "fields": [
+                    "id",
+                    "name",
+                    "phone",
+                    "mobile",
+                    "email"
+                ],
+                "limit": len(partner_ids)
+            }
+        )
+
+        tagged_contacts = []
+        without_phone = []
+        not_found_in_manychat = []
+        errors = []
+
+        processed_subscribers = set()
+
+        # 4. Buscar cada teléfono en ManyChat
+        for partner in partners:
+            phone = (
+                partner.get("mobile")
+                or partner.get("phone")
+            )
+
+            if not phone:
+                without_phone.append({
+                    "odoo_partner_id": partner.get("id"),
+                    "name": partner.get("name")
+                })
+                continue
+
+            try:
+                manychat_contact = find_manychat_contact(
+                    phone
+                )
+
+                subscriber_id = manychat_contact.get(
+                    "subscriber_id"
+                )
+
+                if not subscriber_id:
+                    not_found_in_manychat.append({
+                        "odoo_partner_id": partner.get("id"),
+                        "name": partner.get("name"),
+                        "odoo_phone": phone,
+                        "attempted_phones": (
+                            manychat_contact.get(
+                                "attempted_phones"
+                            )
+                        )
+                    })
+                    continue
+
+                if subscriber_id in processed_subscribers:
+                    continue
+
+                # 5. Poner etiqueta
+                add_manychat_tag(subscriber_id)
+
+                processed_subscribers.add(subscriber_id)
+
+                tagged_contacts.append({
+                    "odoo_partner_id": partner.get("id"),
+                    "name": partner.get("name"),
+                    "odoo_phone": phone,
+                    "manychat_phone": (
+                        manychat_contact.get(
+                            "matched_phone"
+                        )
+                    ),
+                    "subscriber_id": subscriber_id,
+                    "tag": MONTEVERDE_TAG
+                })
+
+                time.sleep(0.12)
+
+            except Exception as error:
+                errors.append({
+                    "odoo_partner_id": partner.get("id"),
+                    "name": partner.get("name"),
+                    "phone": phone,
+                    "error": str(error)
+                })
+
+        return {
+            "status": "completed",
+            "orders_found": len(orders),
+            "unique_clients": len(partner_ids),
+            "tagged": len(tagged_contacts),
+            "without_phone_count": len(without_phone),
+            "not_found_in_manychat_count": len(
+                not_found_in_manychat
+            ),
+            "error_count": len(errors),
+            "tagged_contacts": tagged_contacts,
+            "without_phone": without_phone,
+            "not_found_in_manychat": (
+                not_found_in_manychat
+            ),
+            "errors": errors
+        }
+
+    except Exception as error:
+        logger.exception(
+            "Error en /tag_monteverde"
+        )
+
+        return {
+            "status": "error",
+            "message": str(error)
+        }
+
