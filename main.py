@@ -1080,3 +1080,303 @@ async def tag_monteverde(request: Request):
             "message": str(error)
         }
 
+# ============================================================
+# ETIQUETAR MONTEVERDE UTILIZANDO EL NÚMERO DE PEDIDO
+# ============================================================
+
+ODOO_ORDER_FIELD_NAME = "odoo_order_number"
+
+
+def get_manychat_custom_field_id(field_name):
+    """
+    Obtiene automáticamente el ID del campo personalizado
+    de ManyChat usando su nombre.
+    """
+    url = "https://api.manychat.com/fb/page/getCustomFields"
+
+    response = requests.get(
+        url,
+        headers=HEADERS,
+        timeout=20
+    )
+
+    try:
+        result = response.json()
+    except Exception:
+        raise Exception(
+            f"ManyChat no devolvió JSON: {response.text}"
+        )
+
+    if not response.ok:
+        raise Exception(
+            f"Error consultando campos de ManyChat: "
+            f"{response.status_code} - {response.text}"
+        )
+
+    fields = result.get("data") or []
+
+    # Compatibilidad por si ManyChat devuelve un objeto
+    # en lugar de una lista directa.
+    if isinstance(fields, dict):
+        fields = (
+            fields.get("fields")
+            or fields.get("custom_fields")
+            or []
+        )
+
+    for field in fields:
+        current_name = (
+            field.get("name")
+            or field.get("caption")
+            or ""
+        )
+
+        if current_name.strip().lower() == field_name.lower():
+            return field.get("id")
+
+    available_fields = [
+        field.get("name") or field.get("caption")
+        for field in fields
+    ]
+
+    raise Exception(
+        f"No se encontró el campo '{field_name}'. "
+        f"Campos disponibles: {available_fields}"
+    )
+
+
+def find_manychat_by_order_number(field_id, order_number):
+    """
+    Busca contactos de ManyChat cuyo campo
+    odoo_order_number coincida con el pedido.
+    """
+    url = (
+        "https://api.manychat.com/"
+        "fb/subscriber/findByCustomField"
+    )
+
+    response = requests.get(
+        url,
+        params={
+            "field_id": field_id,
+            "field_value": order_number
+        },
+        headers=HEADERS,
+        timeout=20
+    )
+
+    try:
+        result = response.json()
+    except Exception:
+        raise Exception(
+            f"ManyChat no devolvió JSON: {response.text}"
+        )
+
+    if not response.ok:
+        raise Exception(
+            f"Error buscando pedido {order_number}: "
+            f"{response.status_code} - {response.text}"
+        )
+
+    contacts = result.get("data") or []
+
+    # Por seguridad, convertir un contacto único en lista.
+    if isinstance(contacts, dict):
+        contacts = [contacts]
+
+    return [
+        contact
+        for contact in contacts
+        if contact.get("id")
+    ]
+
+
+@app.post("/tag_monteverde_por_pedido")
+async def tag_monteverde_por_pedido():
+    """
+    Busca todos los pedidos del sitio Monteverde en Odoo,
+    localiza esos números de pedido en ManyChat y agrega
+    la etiqueta Colegio - Monteverde.
+    """
+    try:
+        # 1. Conectarse con Odoo
+        common = xmlrpc.client.ServerProxy(
+            f"{ODOO_URL}/xmlrpc/2/common"
+        )
+
+        uid = common.authenticate(
+            ODOO_DB,
+            ODOO_USER,
+            ODOO_PASSWORD,
+            {}
+        )
+
+        if not uid:
+            return {
+                "status": "error",
+                "message": "No se pudo autenticar con Odoo."
+            }
+
+        models = xmlrpc.client.ServerProxy(
+            f"{ODOO_URL}/xmlrpc/2/object"
+        )
+
+        # 2. Buscar el sitio web de Monteverde
+        websites = models.execute_kw(
+            ODOO_DB,
+            uid,
+            ODOO_PASSWORD,
+            "website",
+            "search_read",
+            [[
+                ["name", "ilike", "Monteverde"]
+            ]],
+            {
+                "fields": [
+                    "id",
+                    "name"
+                ],
+                "limit": 20
+            }
+        )
+
+        if not websites:
+            return {
+                "status": "not_found",
+                "message": (
+                    "No se encontró un sitio de Odoo "
+                    "con la palabra Monteverde."
+                )
+            }
+
+        website_ids = [
+            website["id"]
+            for website in websites
+        ]
+
+        # 3. Obtener los pedidos de Monteverde
+        orders = models.execute_kw(
+            ODOO_DB,
+            uid,
+            ODOO_PASSWORD,
+            "sale.order",
+            "search_read",
+            [[
+                ["website_id", "in", website_ids],
+                ["state", "!=", "cancel"]
+            ]],
+            {
+                "fields": [
+                    "id",
+                    "name",
+                    "website_id"
+                ],
+                "limit": 5000,
+                "order": "id desc"
+            }
+        )
+
+        if not orders:
+            return {
+                "status": "completed",
+                "message": (
+                    "No se encontraron pedidos de Monteverde."
+                ),
+                "orders_found": 0,
+                "tagged_contacts": 0
+            }
+
+        # Eliminar pedidos repetidos
+        order_numbers = list(dict.fromkeys([
+            str(order.get("name") or "").strip()
+            for order in orders
+            if order.get("name")
+        ]))
+
+        # 4. Obtener automáticamente el ID
+        # del campo odoo_order_number
+        field_id = get_manychat_custom_field_id(
+            ODOO_ORDER_FIELD_NAME
+        )
+
+        tagged = []
+        not_found = []
+        errors = []
+
+        processed_subscribers = set()
+
+        # 5. Buscar cada pedido dentro de ManyChat
+        for order_number in order_numbers:
+            try:
+                contacts = find_manychat_by_order_number(
+                    field_id,
+                    order_number
+                )
+
+                if not contacts:
+                    not_found.append(order_number)
+                    time.sleep(0.12)
+                    continue
+
+                for contact in contacts:
+                    subscriber_id = contact.get("id")
+
+                    if not subscriber_id:
+                        continue
+
+                    if subscriber_id in processed_subscribers:
+                        continue
+
+                    add_manychat_tag(subscriber_id)
+
+                    processed_subscribers.add(
+                        subscriber_id
+                    )
+
+                    tagged.append({
+                        "order_number": order_number,
+                        "subscriber_id": subscriber_id,
+                        "name": (
+                            contact.get("name")
+                            or contact.get("first_name")
+                        ),
+                        "tag": MONTEVERDE_TAG
+                    })
+
+                    time.sleep(0.12)
+
+                time.sleep(0.12)
+
+            except Exception as error:
+                errors.append({
+                    "order_number": order_number,
+                    "error": str(error)
+                })
+
+        return {
+            "status": "completed",
+            "website_names": [
+                website.get("name")
+                for website in websites
+            ],
+            "manychat_field_name": ODOO_ORDER_FIELD_NAME,
+            "manychat_field_id": field_id,
+            "orders_found": len(order_numbers),
+            "tagged_contacts": len(tagged),
+            "not_found_count": len(not_found),
+            "error_count": len(errors),
+            "tagged": tagged,
+            "orders_not_found_in_manychat": not_found,
+            "errors": errors
+        }
+
+    except Exception as error:
+        logger.exception(
+            "Error en /tag_monteverde_por_pedido"
+        )
+
+        return {
+            "status": "error",
+            "message": str(error)
+        }
+
