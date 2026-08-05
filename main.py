@@ -10,6 +10,8 @@ from chatgpt_odoo_api import chatgpt_app
 
 app = FastAPI()
 
+app.mount("/chatgpt", chatgpt_app)
+
 # 🔐 Variables de entorno
 ODOO_URL = os.getenv("ODOO_URL")
 ODOO_DB = os.getenv("ODOO_DB")
