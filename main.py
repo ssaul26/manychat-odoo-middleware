@@ -975,7 +975,6 @@ async def tag_monteverde(request: Request):
                     "id",
                     "name",
                     "phone",
-                    "mobile",
                     "email"
                 ],
                 "limit": len(partner_ids)
@@ -991,10 +990,7 @@ async def tag_monteverde(request: Request):
 
         # 4. Buscar cada teléfono en ManyChat
         for partner in partners:
-            phone = (
-                partner.get("mobile")
-                or partner.get("phone")
-            )
+            phone = partner.get("phone")
 
             if not phone:
                 without_phone.append({
