@@ -6,6 +6,7 @@ from datetime import datetime
 import unicodedata, time, re
 import logging
 import requests
+from chatgpt_odoo_api import chatgpt_app
 
 app = FastAPI()
 
