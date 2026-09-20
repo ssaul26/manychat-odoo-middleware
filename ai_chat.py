@@ -151,7 +151,7 @@ def consultar_pedido(school: str, order_number: str, phone: Optional[str]):
             ODOO_DB, uid, ODOO_PASSWORD,
             "res.partner", "read",
             [[partner_id]],
-            {"fields": ["name", "phone", "mobile"]}
+            {"fields": ["name", "phone"]}
         )
         partner_data = partners[0] if partners else None
 
@@ -161,7 +161,6 @@ def consultar_pedido(school: str, order_number: str, phone: Optional[str]):
         incoming = _phone10(phone)
         candidate_phones = {
             _phone10(partner_data.get("phone")),
-            _phone10(partner_data.get("mobile")),
         }
         candidate_phones.discard("")
         if candidate_phones and incoming not in candidate_phones:
@@ -527,6 +526,5 @@ MENSAJE ACTUAL DEL CLIENTE:
             **context,
             "needs_human": True,
             "escalation_reason": "backend_error",
-            "error": str(exc),
             "tools_used": tools_used,
         }
