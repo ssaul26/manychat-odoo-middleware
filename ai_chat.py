@@ -8,6 +8,7 @@ import os
 import re
 import unicodedata
 import xmlrpc.client
+from urllib.parse import urljoin
 
 from openai import OpenAI
 
@@ -213,6 +214,191 @@ def buscar_info_escuela(school: str, query: str):
     }
 
 
+def _available_fields(uid, models, model_name: str):
+    """Lee los campos reales del modelo para tolerar diferencias entre bases/versiones de Odoo."""
+    try:
+        return models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD,
+            model_name, "fields_get",
+            [],
+            {"attributes": ["type"]},
+        ) or {}
+    except Exception:
+        logger.warning("No se pudieron leer fields_get de %s", model_name, exc_info=True)
+        return {}
+
+
+def _absolute_website_url(base: Optional[str], path: Optional[str]) -> Optional[str]:
+    path = (path or "").strip()
+    if not path:
+        return None
+
+    if path.startswith("http://") or path.startswith("https://"):
+        return path
+
+    base = (base or ODOO_URL or "").strip()
+    if not base:
+        return None
+    if not base.startswith("http://") and not base.startswith("https://"):
+        base = "https://" + base
+
+    return urljoin(base.rstrip("/") + "/", path.lstrip("/"))
+
+
+def buscar_producto_escuela(school: str, query: str):
+    """
+    Busca productos vendibles de una escuela y devuelve enlaces de eCommerce.
+
+    Esta herramienta NO usa stock para decidir qué decir al cliente. El inventario puede
+    estar desactualizado y SportHouse puede permitir comprar productos temporalmente sin
+    existencia física. Su objetivo es encontrar el producto/página correcta de la escuela.
+    """
+    school = (school or "").strip()
+    query = (query or "").strip()
+
+    if not school:
+        return {
+            "status": "missing_school",
+            "message": "Falta la escuela. Pregunta al cliente antes de buscar productos.",
+        }
+
+    uid, models = _odoo()
+
+    # Resolver el sitio de la escuela para construir URLs correctas en multi-sitio.
+    website_fields = _available_fields(uid, models, "website")
+    website_read_fields = [f for f in ("id", "name", "domain") if f in website_fields or f in ("id", "name")]
+    websites = models.execute_kw(
+        ODOO_DB, uid, ODOO_PASSWORD,
+        "website", "search_read",
+        [[['name', 'ilike', school]]],
+        {"fields": website_read_fields, "limit": 20, "order": "id asc"},
+    )
+
+    school_website = websites[0] if websites else None
+    school_domain = (school_website or {}).get("domain") or ODOO_URL
+    school_website_id = (school_website or {}).get("id")
+    school_shop_url = _absolute_website_url(school_domain, "/shop")
+
+    product_fields = _available_fields(uid, models, "product.template")
+    read_fields = ["id", "name", "categ_id"]
+    for optional in ("website_url", "website_id", "website_published", "is_published", "sale_ok", "active"):
+        if optional in product_fields:
+            read_fields.append(optional)
+
+    # La integración existente de SportHouse ya organiza los productos por categoría/escuela.
+    # Eso actúa como frontera principal para no mezclar catálogos entre colegios.
+    domain = [["categ_id.name", "ilike", school]]
+    if "active" in product_fields:
+        domain.append(["active", "=", True])
+    if "sale_ok" in product_fields:
+        domain.append(["sale_ok", "=", True])
+
+    products = models.execute_kw(
+        ODOO_DB, uid, ODOO_PASSWORD,
+        "product.template", "search_read",
+        [domain],
+        {
+            "fields": read_fields,
+            "limit": 120,
+            "order": "name asc",
+        },
+    )
+
+    if not products:
+        return {
+            "status": "not_found",
+            "school": school,
+            "query": query,
+            "school_shop_url": school_shop_url,
+            "message": "No se encontraron productos configurados para esa escuela.",
+        }
+
+    # Si algunos productos están asociados a un website concreto, obtenemos esos dominios.
+    website_ids = {
+        p.get("website_id")[0]
+        for p in products
+        if isinstance(p.get("website_id"), (list, tuple)) and p.get("website_id")
+    }
+    website_domain_by_id = {}
+    if website_ids:
+        all_websites = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD,
+            "website", "search_read",
+            [[['id', 'in', list(website_ids)]]],
+            {"fields": website_read_fields, "limit": len(website_ids)},
+        )
+        website_domain_by_id = {
+            w.get("id"): (w.get("domain") or ODOO_URL)
+            for w in all_websites
+        }
+
+    query_norm = _norm(query)
+    query_tokens = [t for t in re.findall(r"[a-z0-9]+", query_norm) if len(t) >= 2]
+
+    candidates = []
+    for product in products:
+        name = (product.get("name") or "").strip()
+        name_norm = _norm(name)
+
+        score = 0
+        if query_norm and query_norm in name_norm:
+            score += 100
+        for token in query_tokens:
+            if token in name_norm:
+                score += 10
+
+        website_id_value = product.get("website_id")
+        product_website_id = (
+            website_id_value[0]
+            if isinstance(website_id_value, (list, tuple)) and website_id_value
+            else None
+        )
+        base_domain = website_domain_by_id.get(product_website_id) or school_domain
+
+        published = None
+        if "website_published" in product:
+            published = bool(product.get("website_published"))
+        elif "is_published" in product:
+            published = bool(product.get("is_published"))
+
+        product_url = _absolute_website_url(base_domain, product.get("website_url"))
+        # Si Odoo confirma que no está publicado, no entregamos una URL de producto como comprable.
+        if published is False:
+            product_url = None
+
+        category = product.get("categ_id")
+        candidates.append({
+            "name": name,
+            "category": category[1] if isinstance(category, (list, tuple)) and len(category) > 1 else None,
+            "product_url": product_url,
+            "published": published,
+            "_score": score,
+        })
+
+    candidates.sort(key=lambda x: (-x["_score"], _norm(x["name"])))
+
+    # Si hay coincidencias textuales, mandamos las mejores. Si no, damos una muestra más
+    # amplia del catálogo para que la IA pueda resolver lenguaje natural/sinónimos.
+    positive = [c for c in candidates if c["_score"] > 0]
+    selected = (positive[:20] if positive else candidates[:45])
+    for item in selected:
+        item.pop("_score", None)
+
+    return {
+        "status": "ok",
+        "school": school,
+        "query": query,
+        "school_website_id": school_website_id,
+        "school_shop_url": school_shop_url,
+        "total_products_in_school": len(products),
+        "candidates": selected,
+        "inventory_policy": (
+            "No afirmar hay/no hay stock con esta herramienta. "
+            "Dirigir al cliente al producto o a la tienda de la escuela para revisar opciones y comprar."
+        ),
+    }
+
+
 def escalar_asesor(reason: str):
     """Marca el caso para que ManyChat pueda enviarlo después a atención humana."""
     return {
@@ -266,6 +452,32 @@ TOOLS = [
                 "query": {
                     "type": "string",
                     "description": "Qué información necesitas encontrar para responder al cliente.",
+                },
+            },
+            "required": ["school", "query"],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+    {
+        "type": "function",
+        "name": "buscar_producto_escuela",
+        "description": (
+            "Busca en el catálogo de Odoo los productos de una escuela y devuelve las páginas web correctas para comprar. "
+            "Úsala cuando el cliente pregunte si venden/tienen un producto, una prenda, una talla, dónde comprarla o pida el link. "
+            "La herramienta NO confirma stock físico: aunque Odoo marque cero puede permitirse la compra. "
+            "Interpreta los candidatos y dirige al producto correcto o, si no hay coincidencia clara, a la tienda de la escuela."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "school": {
+                    "type": "string",
+                    "description": "Escuela confirmada del cliente.",
+                },
+                "query": {
+                    "type": "string",
+                    "description": "Descripción libre del producto/prenda que el cliente busca. Puede incluir talla, deporte, género u otros detalles.",
                 },
             },
             "required": ["school", "query"],
@@ -381,10 +593,21 @@ Si la pregunta es sobre políticas, tiempos, formas de compra, ubicaciones, camb
 información específica de una escuela, usa buscar_info_escuela una vez que la escuela esté clara. Responde
 solo con información respaldada por esa herramienta. Si no aparece la respuesta, puedes escalar a asesor.
 
-PRODUCTOS E INVENTARIO
-Todavía NO existe una herramienta de inventario por variante en esta versión. Puedes entender y conservar
-escuela, producto y talla, pero nunca afirmes disponibilidad real. Si la persona necesita confirmar stock,
-explícalo de forma natural y marca el caso para asesor con escalar_asesor. Más adelante se añadirá la herramienta.
+PRODUCTOS, TALLAS Y COMPRA
+Para preguntas como “¿tienen hoodie?”, “¿venden pants?”, “¿hay talla M?”, “¿dónde compro esta prenda?” o
+“pásame el link”, usa buscar_producto_escuela cuando la escuela esté clara. Esa herramienta encuentra el
+catálogo y las páginas web correctas de la escuela.
+
+MUY IMPORTANTE: el inventario físico de Odoo puede no estar totalmente actualizado y SportHouse puede permitir
+comprar productos aunque temporalmente no haya existencia física. Por eso:
+- Nunca conviertas stock interno en una afirmación de “sí hay” o “no hay”.
+- No prometas existencia física ni cantidad disponible.
+- Si la herramienta encuentra el producto, dirige al cliente a su página para revisar opciones y comprar.
+- Si preguntan por una talla, puedes decir que revise/seleccione las opciones disponibles en la página; no afirmes
+  disponibilidad física de esa talla salvo que en el futuro exista una fuente explícita autorizada para ello.
+- Si hay varios productos plausibles, conversa para identificar cuál busca en vez de elegir al azar.
+- Si no hay coincidencia clara pero existe school_shop_url, puedes dirigir a la tienda de la escuela.
+- Nunca mandes un link de producto de otra escuela.
 
 VARIOS TEMAS EN EL MISMO MENSAJE
 No fuerces una sola intención. Si una mamá pregunta dos o más cosas, resuelve todas las que puedas. Puedes
@@ -546,6 +769,12 @@ async def chat(data: ChatRequest):
 
                 elif call.name == "buscar_info_escuela":
                     tool_result = buscar_info_escuela(
+                        school=args.get("school"),
+                        query=args.get("query"),
+                    )
+
+                elif call.name == "buscar_producto_escuela":
+                    tool_result = buscar_producto_escuela(
                         school=args.get("school"),
                         query=args.get("query"),
                     )
