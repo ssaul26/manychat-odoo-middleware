@@ -7,6 +7,9 @@ import logging
 import os
 import re
 import unicodedata
+import hashlib
+import math
+import time
 import xmlrpc.client
 from urllib.parse import urljoin
 
@@ -21,6 +24,7 @@ ODOO_USER = os.getenv("ODOO_USER")
 ODOO_PASSWORD = os.getenv("ODOO_PASSWORD")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6-luna")
+OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
 
 
 class ChatRequest(BaseModel):
@@ -494,17 +498,283 @@ def consultar_pedido(school: str, order_number: str):
     }
 
 
+
+_KNOWLEDGE_ARTICLE_CACHE = {"ts": 0.0, "items": []}
+_KNOWLEDGE_ARTICLE_CACHE_TTL = 300
+_EMBEDDING_CACHE = {}
+_EMBEDDING_CACHE_MAX = 4000
+
+
+def _load_knowledge_articles(uid, models):
+    """Carga artículos de Knowledge una vez por TTL para que la búsqueda sea global y consistente."""
+    now = time.time()
+    if (
+        _KNOWLEDGE_ARTICLE_CACHE["items"]
+        and now - _KNOWLEDGE_ARTICLE_CACHE["ts"] < _KNOWLEDGE_ARTICLE_CACHE_TTL
+    ):
+        return _KNOWLEDGE_ARTICLE_CACHE["items"]
+
+    rows = models.execute_kw(
+        ODOO_DB, uid, ODOO_PASSWORD,
+        "knowledge.article", "search_read",
+        [[]],
+        {
+            "fields": ["id", "name", "body"],
+            "order": "name asc",
+            "limit": 1500,
+        },
+    ) or []
+
+    cleaned = []
+    for row in rows:
+        cleaned.append({
+            "id": row.get("id"),
+            "name": (row.get("name") or "").strip(),
+            "text": _clean_html(row.get("body") or ""),
+        })
+
+    _KNOWLEDGE_ARTICLE_CACHE.update({"ts": now, "items": cleaned})
+    return cleaned
+
+
+def _knowledge_scope_aliases(resolved_school: dict):
+    """
+    Devuelve los nombres que definen el universo permitido de conocimiento.
+    Ejemplo IMS -> Instituto México Secundaria + Maristas.
+    """
+    aliases = []
+    for value in (
+        resolved_school.get("canonical_school"),
+        resolved_school.get("parent_website"),
+    ):
+        value = (value or "").strip()
+        if not value:
+            continue
+        if not any(_norm(value) == _norm(existing) for existing in aliases):
+            aliases.append(value)
+    return aliases
+
+
+def _article_scope_score(article: dict, aliases: list[str]) -> float:
+    """
+    Decide si un artículo pertenece a la escuela/grupo sin depender de un catálogo de temas.
+    Se apoya en el título y, como fallback, en menciones explícitas dentro del contenido.
+    """
+    title = article.get("name") or ""
+    body = article.get("text") or ""
+    title_norm = _norm(title)
+    body_norm = _norm(body[:6000])
+    best = 0.0
+
+    for alias in aliases:
+        if not alias:
+            continue
+        alias_norm = _norm(alias)
+        score = _school_match_score(alias, title)
+        if alias_norm and alias_norm in title_norm:
+            score = max(score, 95.0)
+        elif alias_norm and alias_norm in body_norm:
+            score = max(score, 62.0)
+        best = max(best, score)
+
+    return best
+
+
+def _chunk_text(text: str, max_chars: int = 1400, overlap: int = 180):
+    """Divide artículos largos para recuperar el fragmento relevante, no el documento completo."""
+    text = (text or "").strip()
+    if not text:
+        return []
+    if len(text) <= max_chars:
+        return [text]
+
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = min(len(text), start + max_chars)
+        chunk = text[start:end]
+
+        # Intentar cortar cerca de un salto o final de frase para conservar legibilidad.
+        if end < len(text):
+            cut_candidates = [
+                chunk.rfind("\n\n"),
+                chunk.rfind("\n"),
+                chunk.rfind(". "),
+            ]
+            cut = max(cut_candidates)
+            if cut >= int(max_chars * 0.55):
+                end = start + cut + (2 if chunk[cut:cut+2] == ". " else 0)
+                chunk = text[start:end]
+
+        chunk = chunk.strip()
+        if chunk:
+            chunks.append(chunk)
+        if end >= len(text):
+            break
+        start = max(start + 1, end - overlap)
+
+    return chunks
+
+
+def _normalize_vector(vector):
+    norm = math.sqrt(sum(float(x) * float(x) for x in vector)) or 1.0
+    return [float(x) / norm for x in vector]
+
+
+def _embedding_cache_key(text: str) -> str:
+    payload = f"{OPENAI_EMBEDDING_MODEL}\n{text}".encode("utf-8", errors="ignore")
+    return hashlib.sha1(payload).hexdigest()
+
+
+def _embed_texts(texts: list[str]):
+    """
+    Embeddings con caché en memoria. Si OpenAI no está disponible, el caller usa ranking léxico.
+    """
+    if not texts or not OPENAI_API_KEY:
+        return [None] * len(texts)
+
+    result = [None] * len(texts)
+    missing_indexes = []
+    missing_texts = []
+
+    for idx, text in enumerate(texts):
+        key = _embedding_cache_key(text)
+        cached = _EMBEDDING_CACHE.get(key)
+        if cached is not None:
+            result[idx] = cached
+        else:
+            missing_indexes.append(idx)
+            missing_texts.append(text)
+
+    if missing_texts:
+        client = OpenAI(api_key=OPENAI_API_KEY)
+        # Batch corto para evitar requests gigantes si alguna escuela tiene mucho contenido.
+        cursor = 0
+        while cursor < len(missing_texts):
+            batch_texts = missing_texts[cursor:cursor + 64]
+            response = client.embeddings.create(
+                model=OPENAI_EMBEDDING_MODEL,
+                input=batch_texts,
+            )
+            for offset, item in enumerate(response.data):
+                global_missing_pos = cursor + offset
+                original_idx = missing_indexes[global_missing_pos]
+                vector = _normalize_vector(item.embedding)
+                result[original_idx] = vector
+                _EMBEDDING_CACHE[_embedding_cache_key(texts[original_idx])] = vector
+            cursor += len(batch_texts)
+
+        # Límite sencillo de memoria; si crece demasiado, empezamos caché fresca.
+        if len(_EMBEDDING_CACHE) > _EMBEDDING_CACHE_MAX:
+            _EMBEDDING_CACHE.clear()
+
+    return result
+
+
+def _lexical_relevance(query: str, title: str, text: str) -> float:
+    q_tokens = {
+        token for token in re.findall(r"[a-z0-9]+", _norm(query))
+        if len(token) >= 3
+    }
+    if not q_tokens:
+        return 0.0
+    title_norm = _norm(title)
+    text_norm = _norm(text)
+    score = 0.0
+    for token in q_tokens:
+        if token in title_norm:
+            score += 3.0
+        if token in text_norm:
+            score += 0.7
+    return score
+
+
+def _semantic_knowledge_search(uid, models, resolved_school: dict, query: str, limit: int = 6):
+    """
+    Búsqueda semántica universal dentro del universo permitido de la escuela/grupo.
+    No clasifica por temas: compara el significado de la pregunta contra fragmentos de todos
+    los artículos relevantes de Odoo.
+    """
+    aliases = _knowledge_scope_aliases(resolved_school)
+    all_articles = _load_knowledge_articles(uid, models)
+
+    scoped = []
+    for article in all_articles:
+        scope_score = _article_scope_score(article, aliases)
+        if scope_score >= 55:
+            scoped.append((scope_score, article))
+
+    if not scoped:
+        return []
+
+    chunk_rows = []
+    for scope_score, article in scoped:
+        chunks = _chunk_text(article.get("text") or "") or [""]
+        for idx, chunk in enumerate(chunks):
+            embedding_text = f"{article.get('name') or ''}\n{chunk}".strip()
+            if not embedding_text:
+                continue
+            chunk_rows.append({
+                "article_id": article.get("id"),
+                "article_name": article.get("name"),
+                "chunk_index": idx,
+                "text": chunk,
+                "embedding_text": embedding_text[:6000],
+                "scope_score": scope_score,
+            })
+
+    if not chunk_rows:
+        return []
+
+    semantic_available = False
+    query_vector = None
+    chunk_vectors = [None] * len(chunk_rows)
+    try:
+        vectors = _embed_texts([query] + [row["embedding_text"] for row in chunk_rows])
+        query_vector = vectors[0]
+        chunk_vectors = vectors[1:]
+        semantic_available = query_vector is not None and any(v is not None for v in chunk_vectors)
+    except Exception:
+        logger.warning("Fallo ranking semántico; usando fallback léxico", exc_info=True)
+
+    ranked = []
+    for idx, row in enumerate(chunk_rows):
+        lexical = _lexical_relevance(query, row["article_name"], row["text"])
+        semantic = 0.0
+        if semantic_available and chunk_vectors[idx] is not None:
+            semantic = sum(a * b for a, b in zip(query_vector, chunk_vectors[idx]))
+        # Scope solo rompe empates; el significado de la pregunta debe dominar.
+        final_score = (semantic * 100.0 if semantic_available else 0.0) + lexical + (row["scope_score"] / 100.0)
+        ranked.append((final_score, semantic, lexical, row))
+
+    ranked.sort(key=lambda x: (-x[0], _norm(x[3].get("article_name") or ""), x[3]["chunk_index"]))
+
+    selected = []
+    per_article = {}
+    for final_score, semantic, lexical, row in ranked:
+        article_id = row.get("article_id")
+        # Máximo dos fragmentos del mismo artículo para dar diversidad de fuentes.
+        if per_article.get(article_id, 0) >= 2:
+            continue
+        per_article[article_id] = per_article.get(article_id, 0) + 1
+        selected.append({
+            "article_id": article_id,
+            "article_name": row.get("article_name"),
+            "text": row.get("text"),
+            "semantic_score": round(float(semantic), 4) if semantic_available else None,
+        })
+        if len(selected) >= limit:
+            break
+
+    return selected
+
+
 def buscar_info_escuela(school: str, query: str):
     """
-    Devuelve conocimiento de Odoo para una escuela concreta y, cuando aplique,
-    para el grupo/sitio al que pertenece.
+    Recupera semánticamente conocimiento de Odoo para la escuela concreta y su grupo.
 
-    Ejemplo conceptual:
-      school = "Instituto México Secundaria"
-      knowledge_group = "Maristas"
-
-    La herramienta NO decide qué artículo responde. Devuelve el conocimiento
-    candidato y la IA elige semánticamente qué parte usar para responder.
+    Esta herramienta es universal: sirve para cualquier información factual o de políticas
+    que viva en Knowledge, sin requerir una ruta/intent específica por tema.
     """
     school = (school or "").strip()
     query = (query or "").strip()
@@ -527,108 +797,43 @@ def buscar_info_escuela(school: str, query: str):
 
     canonical_school = resolved_school.get("canonical_school") or school
     knowledge_group = (resolved_school.get("parent_website") or "").strip() or None
+    matches = _semantic_knowledge_search(uid, models, resolved_school, query, limit=6)
 
-    # Consultamos por separado la escuela concreta y su grupo para evitar que una FAQ
-    # compartida (p. ej. "Compra Maristas") quede invisible para una escuela del grupo.
-    search_terms = []
-    for value, source in (
-        (canonical_school, "school"),
-        (knowledge_group, "group"),
-    ):
-        value = (value or "").strip()
-        if not value:
-            continue
-        if any(_norm(value) == _norm(existing[0]) for existing in search_terms):
-            continue
-        search_terms.append((value, source))
-
-    records_by_id = {}
-    for term, source in search_terms:
-        rows = models.execute_kw(
-            ODOO_DB, uid, ODOO_PASSWORD,
-            "knowledge.article", "search_read",
-            [[["name", "ilike", term]]],
-            {
-                "fields": ["id", "name", "body"],
-                "order": "name asc",
-                "limit": 30,
-            },
-        )
-        for row in rows or []:
-            rec_id = row.get("id")
-            if rec_id is None:
-                continue
-            item = records_by_id.setdefault(rec_id, {
-                "id": rec_id,
-                "name": row.get("name"),
-                "body": row.get("body") or "",
-                "matched_by": [],
-            })
-            if source not in item["matched_by"]:
-                item["matched_by"].append(source)
-
-    if not records_by_id:
+    if not matches:
         return {
             "status": "not_found",
             "school": canonical_school,
             "knowledge_group": knowledge_group,
             "query": query,
-            "message": "No se encontró información de conocimiento para esa escuela ni para su grupo.",
+            "message": "No encontré información relevante en Knowledge para esa escuela o su grupo.",
         }
-
-    # Dejamos la selección semántica a la IA. Solo ordenamos para enviar primero artículos
-    # con alguna coincidencia textual con la consulta, sin convertir esto en un router por ifs.
-    query_tokens = {
-        token for token in re.findall(r"[a-z0-9]+", _norm(query))
-        if len(token) >= 3
-    }
-
-    ranked = []
-    for item in records_by_id.values():
-        title_norm = _norm(item.get("name") or "")
-        body_text = _clean_html(item.get("body") or "")
-        body_norm = _norm(body_text[:4000])
-        score = 0
-        for token in query_tokens:
-            if token in title_norm:
-                score += 8
-            elif token in body_norm:
-                score += 1
-        # Los artículos específicos de la escuela van antes cuando hay empate; los de grupo
-        # siguen disponibles y son esenciales para información compartida.
-        if "school" in item.get("matched_by", []):
-            score += 2
-        ranked.append((score, item, body_text))
-
-    ranked.sort(key=lambda x: (-x[0], _norm(x[1].get("name") or "")))
-
-    cleaned = []
-    total_chars = 0
-    for score, item, body_text in ranked:
-        if not body_text:
-            continue
-        remaining = max(0, 20000 - total_chars)
-        if remaining <= 0:
-            break
-        snippet = body_text[:remaining]
-        total_chars += len(snippet)
-        cleaned.append({
-            "name": item.get("name"),
-            "text": snippet,
-            "matched_by": item.get("matched_by") or [],
-        })
 
     return {
         "status": "ok",
         "school": canonical_school,
         "knowledge_group": knowledge_group,
         "query": query,
-        "articles": cleaned,
+        "matches": matches,
         "instruction": (
-            "Usa únicamente la información de estos artículos. La escuela concreta sigue siendo "
-            "el contexto del cliente; los artículos del grupo contienen información compartida."
+            "Responde únicamente con información respaldada por estos fragmentos. "
+            "Puedes combinar varios si son complementarios. Si los fragmentos no responden "
+            "por completo, usa otras herramientas necesarias antes de concluir o escalar."
         ),
     }
+
+
+def _format_prefetched_knowledge(prefetched: Optional[dict]) -> str:
+    if not prefetched or prefetched.get("status") != "ok":
+        return "No se recuperó conocimiento relevante automáticamente en este turno."
+
+    lines = [
+        f"Escuela canónica: {prefetched.get('school') or ''}",
+        f"Grupo de conocimiento: {prefetched.get('knowledge_group') or 'ninguno'}",
+        "Fragmentos semánticamente relevantes de Knowledge:",
+    ]
+    for idx, item in enumerate(prefetched.get("matches") or [], 1):
+        lines.append(f"[{idx}] {item.get('article_name')}:\n{item.get('text')}")
+    return "\n\n".join(lines)
 
 def _available_fields(uid, models, model_name: str):
     """Lee los campos reales del modelo para tolerar diferencias entre bases/versiones de Odoo."""
@@ -857,8 +1062,10 @@ TOOLS = [
         "type": "function",
         "name": "buscar_info_escuela",
         "description": (
-            "Busca en Odoo FAQs, políticas, links, tiempos, guías, lugares, cambios y otra información "
-            "específica de una escuela. No sirve para inventario ni para consultar pedidos."
+            "Busca semánticamente en toda la base Knowledge de Odoo permitida para la escuela y su grupo. "
+            "Úsala para cualquier información factual, política, instrucción, tiempo, lugar, link, pago, compra, "
+            "cambio, entrega, recolección, guía o explicación que pueda vivir en Knowledge. No depende de palabras "
+            "exactas ni de una categoría fija. Puede combinarse con consultar_pedido o buscar_producto_escuela en el mismo turno."
         ),
         "parameters": {
             "type": "object",
@@ -1015,10 +1222,25 @@ La regla no es memorizar ejemplos: usa criterio conversacional.
 - Para responder estatus usa principalmente sporthouse_status. internal_delivery_state es un dato interno y
   no debe sustituir ni reinterpretar el Estado SportHouse ante el cliente.
 
-FAQ E INFORMACIÓN
-Si la pregunta es sobre políticas, tiempos, formas de compra, ubicaciones, cambios, guías, links u otra
-información específica de una escuela, usa buscar_info_escuela una vez que la escuela esté clara. Responde
-solo con información respaldada por esa herramienta. Si no aparece la respuesta, puedes escalar a asesor.
+FLUJO UNIVERSAL DE CONOCIMIENTO
+Este criterio aplica a TODAS las preguntas de SportHouse, no a una lista cerrada de temas.
+Una vez que la escuela esté clara, antes de responder una pregunta factual revisa el CONOCIMIENTO RECUPERADO
+AUTOMÁTICAMENTE incluido en el contexto. Ese contenido fue seleccionado semánticamente desde Knowledge de Odoo
+para la escuela concreta y, cuando corresponda, su grupo.
+
+Si el conocimiento precargado no basta y la pregunta puede depender de información de SportHouse, llama
+buscar_info_escuela con una consulta descriptiva de lo que necesitas saber. No esperes palabras exactas ni
+clasifiques la pregunta en un catálogo rígido. La búsqueda es semántica.
+
+Puedes y debes combinar Knowledge con herramientas operativas cuando sea necesario. Ejemplos conceptuales:
+- un estatus de pedido puede requerir consultar_pedido + Knowledge para explicar qué sigue, dónde se entrega o tiempos;
+- una pregunta de producto puede requerir buscar_producto_escuela + Knowledge para explicar cómo comprar;
+- una pregunta de políticas puede resolverse solo con Knowledge.
+
+El resultado de una herramienta NO significa automáticamente que la consulta completa esté resuelta. Antes de
+responder, verifica si aún falta información relevante. Antes de escalar por falta de información, si la escuela
+está clara y existe una posibilidad razonable de que la respuesta viva en Knowledge, consulta Knowledge primero.
+Responde únicamente con información respaldada por las herramientas/contexto recuperado.
 
 PRODUCTOS, TALLAS Y COMPRA
 Para preguntas como “¿tienen hoodie?”, “¿venden pants?”, “¿hay talla M?”, “¿dónde compro esta prenda?” o
@@ -1050,7 +1272,8 @@ consideras ambiguo.
 ESCALAMIENTO
 No digas "ya te pasé con un asesor" a menos que realmente hayas llamado escalar_asesor. Si lo llamas,
 puedes decir que un asesor continuará o revisará el caso. No escales solo porque el cliente escribió raro:
-primero conversa y aclara cuando sea razonable.
+primero conversa y aclara cuando sea razonable. Tampoco escales por falta de información factual sin haber
+revisado el conocimiento precargado y, cuando corresponda, haber llamado buscar_info_escuela.
 
 ESTILO
 - Español por defecto.
@@ -1066,7 +1289,7 @@ Los demás campos son contexto operativo para conservar la conversación.
 """.strip()
 
 
-def _external_context(data: ChatRequest) -> str:
+def _external_context(data: ChatRequest, prefetched_knowledge: Optional[dict] = None) -> str:
     return f"""
 CONTEXTO EXTERNO ACTUAL (puede contener valores vacíos):
 - escuela confirmada: {data.school or 'NO CONOCIDA'}
@@ -1075,6 +1298,9 @@ CONTEXTO EXTERNO ACTUAL (puede contener valores vacíos):
 - talla: {data.size or 'NO CONOCIDA'}
 - necesidad/intención previa: {data.intent or 'NO CONOCIDA'}
 - nombre del cliente: {data.first_name or 'NO DISPONIBLE'}
+
+CONOCIMIENTO RECUPERADO AUTOMÁTICAMENTE PARA ESTE TURNO:
+{_format_prefetched_knowledge(prefetched_knowledge)}
 
 MENSAJE NUEVO DEL CLIENTE:
 {data.message.strip()}
@@ -1135,14 +1361,35 @@ async def chat(data: ChatRequest):
 
     client = OpenAI(api_key=OPENAI_API_KEY)
     tools_used = []
+    knowledge_sources = []
     needs_human_from_tool = False
     escalation_reason_from_tool = None
+
+    # Flujo universal: si ManyChat ya conoce la escuela, recuperamos Knowledge semánticamente
+    # ANTES de que el agente decida qué herramientas operativas necesita. Esto aplica a cualquier
+    # pregunta factual y evita depender de que el modelo recuerde llamar una herramienta por tema.
+    prefetched_knowledge = None
+    if data.school:
+        try:
+            prefetched_knowledge = buscar_info_escuela(
+                school=data.school,
+                query=data.message,
+            )
+            if prefetched_knowledge.get("status") == "ok":
+                knowledge_sources.extend([
+                    item.get("article_name")
+                    for item in prefetched_knowledge.get("matches") or []
+                    if item.get("article_name")
+                ])
+        except Exception:
+            logger.warning("No se pudo precargar Knowledge; el agente podrá buscarlo como tool", exc_info=True)
+            prefetched_knowledge = None
 
     try:
         create_args = {
             "model": OPENAI_MODEL,
             "instructions": INSTRUCTIONS,
-            "input": [{"role": "user", "content": _external_context(data)}],
+            "input": [{"role": "user", "content": _external_context(data, prefetched_knowledge)}],
             "tools": TOOLS,
             "tool_choice": "auto",
             "text": {"format": FINAL_RESPONSE_FORMAT},
@@ -1177,6 +1424,7 @@ async def chat(data: ChatRequest):
                     escalation_reason_from_tool=escalation_reason_from_tool,
                 )
                 result["tools_used"] = tools_used
+                result["knowledge_sources"] = list(dict.fromkeys(knowledge_sources))
                 return result
 
             tool_outputs = []
@@ -1199,6 +1447,12 @@ async def chat(data: ChatRequest):
                         school=args.get("school"),
                         query=args.get("query"),
                     )
+                    if tool_result.get("status") == "ok":
+                        knowledge_sources.extend([
+                            item.get("article_name")
+                            for item in tool_result.get("matches") or []
+                            if item.get("article_name")
+                        ])
 
                 elif call.name == "buscar_producto_escuela":
                     tool_result = buscar_producto_escuela(
@@ -1243,6 +1497,7 @@ async def chat(data: ChatRequest):
             "escalation_reason": "tool_loop_limit",
             "response_id": response.id,
             "tools_used": tools_used,
+            "knowledge_sources": list(dict.fromkeys(knowledge_sources)),
         }
 
     except Exception:
@@ -1254,4 +1509,5 @@ async def chat(data: ChatRequest):
             "escalation_reason": "backend_error",
             "response_id": data.previous_response_id,
             "tools_used": tools_used,
+            "knowledge_sources": list(dict.fromkeys(knowledge_sources)),
         }
