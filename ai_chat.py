@@ -49,6 +49,276 @@ def _norm(value: Optional[str]) -> str:
     )
 
 
+
+
+_SCHOOL_STOPWORDS = {
+    "de", "del", "la", "las", "el", "los", "y", "e", "campus",
+}
+
+_SCHOOL_REGISTRY_CACHE = {"ts": 0.0, "items": []}
+_SCHOOL_REGISTRY_TTL = 300
+
+
+def _school_tokens(value: Optional[str]):
+    norm = _norm(value)
+    return [
+        token for token in re.findall(r"[a-z0-9]+", norm)
+        if token and token not in _SCHOOL_STOPWORDS
+    ]
+
+
+def _school_match_score(query: Optional[str], candidate: Optional[str]) -> float:
+    """Puntaje genérico para equivalencias de escuela, incluyendo siglas."""
+    q = _norm(query)
+    c = _norm(candidate)
+    if not q or not c:
+        return 0.0
+    if q == c:
+        return 100.0
+    if q in c or c in q:
+        return 92.0
+
+    qt = _school_tokens(query)
+    ct = _school_tokens(candidate)
+    if not qt or not ct:
+        return 0.0
+
+    q_compact = "".join(qt)
+    c_compact = "".join(ct)
+    q_acronym = "".join(t[0] for t in qt if t)
+    c_acronym = "".join(t[0] for t in ct if t)
+
+    # Ej.: IMS <-> Instituto Mexico Secundaria.
+    if q_compact == c_acronym or c_compact == q_acronym:
+        return 90.0
+    if len(q_compact) <= 6 and q_compact == c_acronym:
+        return 90.0
+    if len(c_compact) <= 6 and c_compact == q_acronym:
+        return 90.0
+
+    qs, cs = set(qt), set(ct)
+    inter = len(qs & cs)
+    if not inter:
+        return 0.0
+
+    containment = inter / min(len(qs), len(cs))
+    jaccard = inter / len(qs | cs)
+    return 70.0 * containment + 25.0 * jaccard
+
+
+def _field_value_label(meta: dict, value):
+    """Convierte selection/many2one/char a una etiqueta humana cuando sea posible."""
+    if value in (None, False, ""):
+        return None
+
+    field_type = (meta or {}).get("type")
+    if field_type == "many2one":
+        if isinstance(value, (list, tuple)) and len(value) > 1:
+            return str(value[1]).strip() or None
+        return str(value).strip() or None
+
+    if field_type == "selection":
+        raw = str(value).strip()
+        for option in (meta or {}).get("selection") or []:
+            if isinstance(option, (list, tuple)) and len(option) >= 2 and str(option[0]) == raw:
+                return str(option[1]).strip() or raw
+        return raw or None
+
+    if isinstance(value, str):
+        return value.strip() or None
+
+    return str(value).strip() or None
+
+
+def _sale_order_school_fields(uid, models):
+    """
+    Descubre campos Studio del pedido que parecen identificar una escuela concreta.
+    No codifica escuelas individuales: usa el nombre visible del campo (p. ej. "Escuela Marista").
+    """
+    try:
+        fields = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD,
+            "sale.order", "fields_get", [],
+            {"attributes": ["type", "string", "selection"]},
+        ) or {}
+    except Exception:
+        logger.warning("No se pudieron descubrir campos de escuela en sale.order", exc_info=True)
+        return {}
+
+    result = {}
+    for name, meta in fields.items():
+        if not name.startswith("x_studio_"):
+            continue
+        label = _norm((meta or {}).get("string"))
+        if not any(word in label for word in ("escuela", "school", "colegio")):
+            continue
+        if (meta or {}).get("type") not in ("selection", "char", "many2one"):
+            continue
+        result[name] = meta
+    return result
+
+
+def _best_parent_website_for_field(field_label: str, websites: list):
+    """Relaciona genéricamente un campo como 'Escuela Marista' con el website 'Maristas'."""
+    label_tokens = [
+        t for t in _school_tokens(field_label)
+        if t not in ("escuela", "school", "colegio")
+    ]
+    label = " ".join(label_tokens)
+    if not label:
+        return None
+
+    scored = []
+    for website in websites:
+        score = _school_match_score(label, website.get("name"))
+        if score > 0:
+            scored.append((score, website))
+    if not scored:
+        return None
+    scored.sort(key=lambda x: -x[0])
+    score, website = scored[0]
+    return website if score >= 55 else None
+
+
+def _school_registry(uid, models):
+    """
+    Construye un catálogo de escuelas resolubles:
+    - websites directos (EDRON, Eton, Maristas, etc.)
+    - escuelas específicas contenidas en grupos, descubiertas desde campos Studio de sale.order.
+
+    Así 'IMS' puede resolver a 'Instituto México Secundaria' y conservar website='Maristas'.
+    """
+    import time
+    now = time.time()
+    if _SCHOOL_REGISTRY_CACHE["items"] and now - _SCHOOL_REGISTRY_CACHE["ts"] < _SCHOOL_REGISTRY_TTL:
+        return _SCHOOL_REGISTRY_CACHE["items"]
+
+    website_fields = _available_fields(uid, models, "website")
+    website_read_fields = [f for f in ("id", "name", "domain") if f in website_fields or f in ("id", "name")]
+    websites = models.execute_kw(
+        ODOO_DB, uid, ODOO_PASSWORD,
+        "website", "search_read", [[]],
+        {"fields": website_read_fields, "limit": 250, "order": "name asc"},
+    )
+
+    items = []
+    for website in websites:
+        items.append({
+            "canonical_school": (website.get("name") or "").strip(),
+            "website_id": website.get("id"),
+            "domain": website.get("domain"),
+            "parent_website": None,
+            "source": "website",
+            "source_field": None,
+        })
+
+    school_fields = _sale_order_school_fields(uid, models)
+    for field_name, meta in school_fields.items():
+        parent = _best_parent_website_for_field((meta or {}).get("string") or field_name, websites)
+        if not parent:
+            continue
+
+        # Los selection son ideales porque permiten descubrir escuelas sin leer miles de pedidos.
+        if (meta or {}).get("type") == "selection":
+            for option in (meta or {}).get("selection") or []:
+                if not isinstance(option, (list, tuple)) or len(option) < 2:
+                    continue
+                label = str(option[1]).strip()
+                if not label:
+                    continue
+                items.append({
+                    "canonical_school": label,
+                    "website_id": parent.get("id"),
+                    "domain": parent.get("domain"),
+                    "parent_website": parent.get("name"),
+                    "source": "sale_order_school_field",
+                    "source_field": field_name,
+                })
+
+    # Deduplicar conservando la variante más específica si coincide el nombre.
+    dedup = {}
+    for item in items:
+        key = _norm(item.get("canonical_school"))
+        if not key:
+            continue
+        current = dedup.get(key)
+        if current is None or (current.get("source") == "website" and item.get("source") != "website"):
+            dedup[key] = item
+
+    result = list(dedup.values())
+    _SCHOOL_REGISTRY_CACHE.update({"ts": now, "items": result})
+    return result
+
+
+def _resolve_school(uid, models, school: str):
+    """
+    Resuelve lo que escribió el cliente contra escuelas reales y grupos/sitios de Odoo.
+    Una escuela puede vivir dentro de un website de grupo; canonical_school y parent_website son distintos.
+    """
+    school = (school or "").strip()
+    if not school:
+        return {"status": "missing_school"}
+
+    registry = _school_registry(uid, models)
+    scored = []
+    for item in registry:
+        score = _school_match_score(school, item.get("canonical_school"))
+        if score > 0:
+            scored.append((score, item))
+
+    if not scored:
+        return {
+            "status": "not_found",
+            "input": school,
+            "message": "No pude relacionar ese nombre con una escuela configurada en Odoo.",
+        }
+
+    scored.sort(key=lambda item: (-item[0], _norm(item[1].get("canonical_school"))))
+    best_score, best = scored[0]
+    second_score = scored[1][0] if len(scored) > 1 else 0.0
+
+    if best_score < 58 or (second_score >= best_score - 4 and best_score < 90):
+        return {
+            "status": "ambiguous",
+            "input": school,
+            "candidates": [
+                {
+                    "name": item.get("canonical_school"),
+                    "group": item.get("parent_website"),
+                    "score": round(score, 1),
+                }
+                for score, item in scored[:5]
+            ],
+            "message": "El nombre puede corresponder a más de una escuela. Pide al cliente que aclare cuál.",
+        }
+
+    return {
+        "status": "ok",
+        "input": school,
+        "canonical_school": best.get("canonical_school"),
+        "website_id": best.get("website_id"),
+        "domain": best.get("domain"),
+        "parent_website": best.get("parent_website"),
+        "source": best.get("source"),
+        "source_field": best.get("source_field"),
+        "score": round(best_score, 1),
+    }
+
+
+def _order_specific_schools(order: dict, field_meta: dict):
+    """Extrae las escuelas específicas guardadas en un pedido (p. ej. x_studio_marista)."""
+    values = []
+    for field_name, meta in field_meta.items():
+        label = _field_value_label(meta, order.get(field_name))
+        if not label:
+            continue
+        values.append({
+            "field": field_name,
+            "field_label": (meta or {}).get("string") or field_name,
+            "school": label,
+        })
+    return values
+
 def _clean_html(value: str) -> str:
     value = html.unescape(value or "")
     value = re.sub(r"<\s*br\s*/?>", "\n", value, flags=re.I)
@@ -82,11 +352,11 @@ def _odoo():
 
 def consultar_pedido(school: str, order_number: str):
     """
-    Herramienta deliberadamente simple.
+    Consulta un pedido real y valida la escuela concreta del pedido.
 
-    La IA interpreta el lenguaje del cliente y solo llama esta función cuando ya
-    decidió cuál es la escuela y cuál es el número canónico del pedido.
-    Esta función NO adivina dígitos ni elige entre números ambiguos.
+    Importante: una escuela puede vivir dentro de un website/grupo (ej. Maristas).
+    Si el pedido tiene un campo Studio de escuela específica, ese dato tiene prioridad
+    sobre website_id para validar la escuela del cliente.
     """
     school = (school or "").strip()
     order_number = re.sub(r"[\s#\-]", "", (order_number or "").upper())
@@ -97,8 +367,6 @@ def consultar_pedido(school: str, order_number: str):
             "message": "Falta la escuela. Pregunta al cliente antes de consultar el pedido.",
         }
 
-    # Única validación de integridad: Odoo usa S + 5 dígitos.
-    # La interpretación de lo que quiso decir el cliente corresponde a la IA.
     if not re.fullmatch(r"S\d{5}", order_number):
         return {
             "status": "invalid_format",
@@ -109,12 +377,16 @@ def consultar_pedido(school: str, order_number: str):
 
     uid, models = _odoo()
 
+    # Descubrimos campos Studio que identifican escuela dentro de un grupo/sitio.
+    school_field_meta = _sale_order_school_fields(uid, models)
+    order_fields = ["id", "name", "website_id"] + list(school_field_meta.keys())
+
     orders = models.execute_kw(
         ODOO_DB, uid, ODOO_PASSWORD,
         "sale.order", "search_read",
-        [[["name", "=", order_number]]],
+        [[['name', '=', order_number]]],
         {
-            "fields": ["id", "name", "website_id"],
+            "fields": order_fields,
             "limit": 1,
         },
     )
@@ -128,22 +400,80 @@ def consultar_pedido(school: str, order_number: str):
 
     order = orders[0]
     website = order.get("website_id")
-    website_name = website[1] if website else ""
+    website_id = website[0] if isinstance(website, (list, tuple)) and website else None
+    website_name = website[1] if isinstance(website, (list, tuple)) and len(website) > 1 else ""
 
-    # Regla de integridad de negocio: nunca mezclar escuelas.
-    school_norm = _norm(school)
-    website_norm = _norm(website_name)
-    if not website_norm or school_norm not in website_norm:
-        return {
-            "status": "school_mismatch",
-            "order_number": order_number,
-            "message": "El pedido no corresponde a la escuela indicada. No reveles información del pedido.",
-        }
+    specific_schools = _order_specific_schools(order, school_field_meta)
+
+    # Primero resolvemos lo que escribió el cliente. Esto entiende siglas como IMS y
+    # puede devolver canonical_school=Instituto México Secundaria, parent_website=Maristas.
+    resolved_school = _resolve_school(uid, models, school)
+
+    # Si el pedido tiene escuela específica, ese dato es la fuente de verdad.
+    # No basta con decir solo el grupo (Maristas) porque puede contener varias escuelas.
+    if specific_schools:
+        scored = []
+        for item in specific_schools:
+            score = _school_match_score(school, item.get("school"))
+            if resolved_school.get("status") == "ok":
+                score = max(
+                    score,
+                    _school_match_score(resolved_school.get("canonical_school"), item.get("school")),
+                )
+            scored.append((score, item))
+
+        scored.sort(key=lambda x: -x[0])
+        best_score, best_specific = scored[0]
+
+        # Caso especial conceptual, no por escuela: el usuario dio el grupo/sitio, pero
+        # el pedido tiene una escuela más específica. Pedimos la escuela concreta.
+        group_score = _school_match_score(school, website_name)
+        if best_score < 58 and group_score >= 85:
+            return {
+                "status": "specific_school_required",
+                "order_number": order_number,
+                "website_group": website_name or None,
+                "message": "El pedido pertenece a un grupo que contiene varias escuelas. Pide la escuela específica antes de revelar el estatus.",
+            }
+
+        if best_score < 58:
+            return {
+                "status": "school_mismatch",
+                "order_number": order_number,
+                "school_input": school,
+                "website_group": website_name or None,
+                "message": "El pedido no corresponde a la escuela indicada. No reveles información del pedido.",
+            }
+
+        canonical_school = best_specific.get("school")
+        school_source_field = best_specific.get("field")
+
+    else:
+        # Pedido sin escuela específica: website_id sí funciona como frontera escolar.
+        if resolved_school.get("status") != "ok":
+            return {
+                "status": "school_unresolved",
+                "school_input": school,
+                "school_resolution": resolved_school,
+                "message": "No pude identificar de forma segura la escuela. Pide una aclaración antes de consultar el pedido.",
+            }
+
+        canonical_school = resolved_school.get("canonical_school") or school
+        canonical_website_id = resolved_school.get("website_id")
+        if not website_id or (canonical_website_id and website_id != canonical_website_id):
+            return {
+                "status": "school_mismatch",
+                "order_number": order_number,
+                "school": canonical_school,
+                "website_group": website_name or None,
+                "message": "El pedido no corresponde a la escuela indicada. No reveles información del pedido.",
+            }
+        school_source_field = None
 
     pickings = models.execute_kw(
         ODOO_DB, uid, ODOO_PASSWORD,
         "stock.picking", "search_read",
-        [[["origin", "=", order_number]]],
+        [[['origin', '=', order_number]]],
         {
             "fields": ["state", "x_studio_estado_sporthouse"],
             "limit": 1,
@@ -156,7 +486,9 @@ def consultar_pedido(school: str, order_number: str):
     return {
         "status": "ok",
         "order_number": order_number,
-        "school": school,
+        "school": canonical_school,
+        "website_group": website_name or None,
+        "school_source_field": school_source_field,
         "sporthouse_status": picking.get("x_studio_estado_sporthouse") or None,
         "internal_delivery_state": picking.get("state") or None,
     }
@@ -174,10 +506,21 @@ def buscar_info_escuela(school: str, query: str):
         }
 
     uid, models = _odoo()
+    resolved_school = _resolve_school(uid, models, school)
+    if resolved_school.get("status") != "ok":
+        return {
+            "status": "school_unresolved",
+            "school_input": school,
+            "school_resolution": resolved_school,
+            "message": "No pude identificar de forma segura la escuela. Pide una aclaración.",
+        }
+    canonical_school = resolved_school.get("canonical_school") or school
+
+    # Buscamos con el nombre canónico; si el usuario usó otra forma, la IA ya no depende de esa sintaxis.
     articles = models.execute_kw(
         ODOO_DB, uid, ODOO_PASSWORD,
         "knowledge.article", "search_read",
-        [[['name', 'ilike', school]]],
+        [[['name', 'ilike', canonical_school]]],
         {
             "fields": ["name", "body"],
             "order": "name asc",
@@ -188,7 +531,7 @@ def buscar_info_escuela(school: str, query: str):
     if not articles:
         return {
             "status": "not_found",
-            "school": school,
+            "school": canonical_school,
             "query": query,
             "message": "No se encontró información de conocimiento para esa escuela.",
         }
@@ -208,7 +551,7 @@ def buscar_info_escuela(school: str, query: str):
 
     return {
         "status": "ok",
-        "school": school,
+        "school": canonical_school,
         "query": query,
         "articles": cleaned,
     }
@@ -264,19 +607,21 @@ def buscar_producto_escuela(school: str, query: str):
 
     uid, models = _odoo()
 
+    resolved_school = _resolve_school(uid, models, school)
+    if resolved_school.get("status") != "ok":
+        return {
+            "status": "school_unresolved",
+            "school_input": school,
+            "school_resolution": resolved_school,
+            "message": "No pude identificar de forma segura la escuela. Pide una aclaración.",
+        }
+    canonical_school = resolved_school.get("canonical_school") or school
+
     # Resolver el sitio de la escuela para construir URLs correctas en multi-sitio.
     website_fields = _available_fields(uid, models, "website")
     website_read_fields = [f for f in ("id", "name", "domain") if f in website_fields or f in ("id", "name")]
-    websites = models.execute_kw(
-        ODOO_DB, uid, ODOO_PASSWORD,
-        "website", "search_read",
-        [[['name', 'ilike', school]]],
-        {"fields": website_read_fields, "limit": 20, "order": "id asc"},
-    )
-
-    school_website = websites[0] if websites else None
-    school_domain = (school_website or {}).get("domain") or ODOO_URL
-    school_website_id = (school_website or {}).get("id")
+    school_website_id = resolved_school.get("website_id")
+    school_domain = resolved_school.get("domain") or ODOO_URL
     school_shop_url = _absolute_website_url(school_domain, "/shop")
 
     product_fields = _available_fields(uid, models, "product.template")
@@ -287,7 +632,7 @@ def buscar_producto_escuela(school: str, query: str):
 
     # La integración existente de SportHouse ya organiza los productos por categoría/escuela.
     # Eso actúa como frontera principal para no mezclar catálogos entre colegios.
-    domain = [["categ_id.name", "ilike", school]]
+    domain = [["categ_id.name", "ilike", canonical_school]]
     if "active" in product_fields:
         domain.append(["active", "=", True])
     if "sale_ok" in product_fields:
@@ -307,7 +652,7 @@ def buscar_producto_escuela(school: str, query: str):
     if not products:
         return {
             "status": "not_found",
-            "school": school,
+            "school": canonical_school,
             "query": query,
             "school_shop_url": school_shop_url,
             "message": "No se encontraron productos configurados para esa escuela.",
@@ -386,7 +731,7 @@ def buscar_producto_escuela(school: str, query: str):
 
     return {
         "status": "ok",
-        "school": school,
+        "school": canonical_school,
         "query": query,
         "school_website_id": school_website_id,
         "school_shop_url": school_shop_url,
@@ -570,6 +915,15 @@ que dependa de catálogo, producto, inventario, talla, precio, guía, política,
 conocer primero la escuela. Nunca adivines la escuela por una prenda. Si no está clara, pregúntala de forma
 natural. Si ya está confirmada en la conversación o en CONTEXTO EXTERNO, no la vuelvas a pedir. Si el cliente
 cambia de escuela explícitamente, actualiza el contexto.
+
+IMPORTANTE: escuela y sitio/grupo NO siempre son lo mismo. Una escuela concreta puede vivir dentro de un
+website de grupo (por ejemplo, una escuela específica dentro de Maristas). Las herramientas pueden devolver
+`school` como la escuela concreta y `website_group`/`parent_website` como el grupo. Cuando exista una escuela
+específica en el pedido, esa escuela tiene prioridad para validar al cliente; el nombre del grupo por sí solo
+puede ser insuficiente. Las herramientas resuelven abreviaciones y siglas contra nombres reales de escuela
+configurados en Odoo. Cuando una herramienta devuelva un nombre canónico de escuela, consérvalo en `school`.
+Si devuelve `specific_school_required`, pregunta la escuela concreta. Si devuelve `school_unresolved` o una
+resolución ambigua, conversa para aclarar; no asumas otra escuela.
 
 PEDIDOS
 El formato canónico de SportHouse es S + 5 dígitos, por ejemplo S02038. El cliente NO tiene que escribirlo
