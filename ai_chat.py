@@ -495,7 +495,17 @@ def consultar_pedido(school: str, order_number: str):
 
 
 def buscar_info_escuela(school: str, query: str):
-    """Devuelve conocimiento de Odoo; la IA decide qué parte responde la pregunta."""
+    """
+    Devuelve conocimiento de Odoo para una escuela concreta y, cuando aplique,
+    para el grupo/sitio al que pertenece.
+
+    Ejemplo conceptual:
+      school = "Instituto México Secundaria"
+      knowledge_group = "Maristas"
+
+    La herramienta NO decide qué artículo responde. Devuelve el conocimiento
+    candidato y la IA elige semánticamente qué parte usar para responder.
+    """
     school = (school or "").strip()
     query = (query or "").strip()
 
@@ -514,48 +524,111 @@ def buscar_info_escuela(school: str, query: str):
             "school_resolution": resolved_school,
             "message": "No pude identificar de forma segura la escuela. Pide una aclaración.",
         }
+
     canonical_school = resolved_school.get("canonical_school") or school
+    knowledge_group = (resolved_school.get("parent_website") or "").strip() or None
 
-    # Buscamos con el nombre canónico; si el usuario usó otra forma, la IA ya no depende de esa sintaxis.
-    articles = models.execute_kw(
-        ODOO_DB, uid, ODOO_PASSWORD,
-        "knowledge.article", "search_read",
-        [[['name', 'ilike', canonical_school]]],
-        {
-            "fields": ["name", "body"],
-            "order": "name asc",
-            "limit": 10,
-        },
-    )
+    # Consultamos por separado la escuela concreta y su grupo para evitar que una FAQ
+    # compartida (p. ej. "Compra Maristas") quede invisible para una escuela del grupo.
+    search_terms = []
+    for value, source in (
+        (canonical_school, "school"),
+        (knowledge_group, "group"),
+    ):
+        value = (value or "").strip()
+        if not value:
+            continue
+        if any(_norm(value) == _norm(existing[0]) for existing in search_terms):
+            continue
+        search_terms.append((value, source))
 
-    if not articles:
+    records_by_id = {}
+    for term, source in search_terms:
+        rows = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD,
+            "knowledge.article", "search_read",
+            [[["name", "ilike", term]]],
+            {
+                "fields": ["id", "name", "body"],
+                "order": "name asc",
+                "limit": 30,
+            },
+        )
+        for row in rows or []:
+            rec_id = row.get("id")
+            if rec_id is None:
+                continue
+            item = records_by_id.setdefault(rec_id, {
+                "id": rec_id,
+                "name": row.get("name"),
+                "body": row.get("body") or "",
+                "matched_by": [],
+            })
+            if source not in item["matched_by"]:
+                item["matched_by"].append(source)
+
+    if not records_by_id:
         return {
             "status": "not_found",
             "school": canonical_school,
+            "knowledge_group": knowledge_group,
             "query": query,
-            "message": "No se encontró información de conocimiento para esa escuela.",
+            "message": "No se encontró información de conocimiento para esa escuela ni para su grupo.",
         }
+
+    # Dejamos la selección semántica a la IA. Solo ordenamos para enviar primero artículos
+    # con alguna coincidencia textual con la consulta, sin convertir esto en un router por ifs.
+    query_tokens = {
+        token for token in re.findall(r"[a-z0-9]+", _norm(query))
+        if len(token) >= 3
+    }
+
+    ranked = []
+    for item in records_by_id.values():
+        title_norm = _norm(item.get("name") or "")
+        body_text = _clean_html(item.get("body") or "")
+        body_norm = _norm(body_text[:4000])
+        score = 0
+        for token in query_tokens:
+            if token in title_norm:
+                score += 8
+            elif token in body_norm:
+                score += 1
+        # Los artículos específicos de la escuela van antes cuando hay empate; los de grupo
+        # siguen disponibles y son esenciales para información compartida.
+        if "school" in item.get("matched_by", []):
+            score += 2
+        ranked.append((score, item, body_text))
+
+    ranked.sort(key=lambda x: (-x[0], _norm(x[1].get("name") or "")))
 
     cleaned = []
     total_chars = 0
-    for article in articles:
-        text = _clean_html(article.get("body") or "")
-        if not text:
+    for score, item, body_text in ranked:
+        if not body_text:
             continue
-        remaining = max(0, 14000 - total_chars)
+        remaining = max(0, 20000 - total_chars)
         if remaining <= 0:
             break
-        text = text[:remaining]
-        total_chars += len(text)
-        cleaned.append({"name": article.get("name"), "text": text})
+        snippet = body_text[:remaining]
+        total_chars += len(snippet)
+        cleaned.append({
+            "name": item.get("name"),
+            "text": snippet,
+            "matched_by": item.get("matched_by") or [],
+        })
 
     return {
         "status": "ok",
         "school": canonical_school,
+        "knowledge_group": knowledge_group,
         "query": query,
         "articles": cleaned,
+        "instruction": (
+            "Usa únicamente la información de estos artículos. La escuela concreta sigue siendo "
+            "el contexto del cliente; los artículos del grupo contienen información compartida."
+        ),
     }
-
 
 def _available_fields(uid, models, model_name: str):
     """Lee los campos reales del modelo para tolerar diferencias entre bases/versiones de Odoo."""
