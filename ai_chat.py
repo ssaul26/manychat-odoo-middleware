@@ -44,8 +44,11 @@ class ChatRequest(BaseModel):
     size: Optional[str] = None
     intent: Optional[str] = None
 
-    # Permite que OpenAI conserve el hilo conversacional completo entre turnos.
-    # ManyChat podrá guardar este valor y reenviarlo en el siguiente mensaje.
+    # Conversación persistente de OpenAI. Este es el identificador principal de memoria.
+    # ManyChat debe guardarlo y reenviarlo en cada turno.
+    conversation_id: Optional[str] = None
+
+    # Compatibilidad temporal con la versión anterior. Ya no es la memoria principal.
     previous_response_id: Optional[str] = None
 
 
@@ -1444,7 +1447,7 @@ puedes responder la otra parte y preguntar lo que falta.
 
 CONTEXTO Y MEMORIA
 Recibirás CONTEXTO EXTERNO con escuela/pedido/producto/talla que ManyChat haya guardado. También puedes
-recibir el historial del hilo mediante previous_response_id. Conserva en tu salida los datos ya confirmados,
+recibir el historial completo mediante una conversación persistente. Conserva en tu salida los datos ya confirmados,
 salvo que el cliente los corrija o cambie explícitamente. No guardes como definitivo un dato que tú mismo
 consideras ambiguo.
 
@@ -1622,14 +1625,22 @@ async def knowledge_sync_status():
 
 @router.post("/chat")
 async def chat(data: ChatRequest):
+    """
+    Entrada única del agente SportHouse.
+
+    La memoria principal vive en un objeto Conversation de OpenAI, no en una cadena frágil
+    de previous_response_id. ManyChat solo necesita conservar `conversation_id`.
+    """
     if not data.message or not data.message.strip():
         return {
             "reply": "¿En qué puedo ayudarte? 😊",
             **_fallback_context(data),
             "needs_human": False,
             "escalation_reason": None,
+            "conversation_id": data.conversation_id,
             "response_id": data.previous_response_id,
             "tools_used": [],
+            "knowledge_sources": [],
         }
 
     if not OPENAI_API_KEY:
@@ -1638,8 +1649,10 @@ async def chat(data: ChatRequest):
             **_fallback_context(data),
             "needs_human": True,
             "escalation_reason": "openai_not_configured",
+            "conversation_id": data.conversation_id,
             "response_id": data.previous_response_id,
             "tools_used": [],
+            "knowledge_sources": [],
         }
 
     client = OpenAI(api_key=OPENAI_API_KEY)
@@ -1648,9 +1661,26 @@ async def chat(data: ChatRequest):
     needs_human_from_tool = False
     escalation_reason_from_tool = None
 
-    # Flujo universal: si ManyChat ya conoce la escuela, recuperamos Knowledge semánticamente
-    # ANTES de que el agente decida qué herramientas operativas necesita. Esto aplica a cualquier
-    # pregunta factual y evita depender de que el modelo recuerde llamar una herramienta por tema.
+    # ------------------------------------------------------------------
+    # 1) Conversación persistente
+    # ------------------------------------------------------------------
+    conversation_id = (data.conversation_id or "").strip() or None
+    conversation_was_created = False
+
+    if not conversation_id:
+        metadata = {"source": "manychat-sporthouse"}
+        if data.contact_id:
+            # metadata values must be short strings
+            metadata["contact_id"] = str(data.contact_id)[:512]
+        conversation = client.conversations.create(metadata=metadata)
+        conversation_id = conversation.id
+        conversation_was_created = True
+
+    # ------------------------------------------------------------------
+    # 2) Prefetch de Knowledge cuando ManyChat ya conoce la escuela.
+    #    Si la escuela aparece por primera vez en el mensaje actual, el modelo puede
+    #    resolverla y llamar buscar_info_escuela dentro del mismo turno.
+    # ------------------------------------------------------------------
     prefetched_knowledge = None
     if data.school:
         try:
@@ -1668,31 +1698,40 @@ async def chat(data: ChatRequest):
             logger.warning("No se pudo precargar Knowledge; el agente podrá buscarlo como tool", exc_info=True)
             prefetched_knowledge = None
 
+    def _create_response(input_items):
+        return client.responses.create(
+            model=OPENAI_MODEL,
+            instructions=INSTRUCTIONS,
+            conversation=conversation_id,
+            input=input_items,
+            tools=TOOLS,
+            tool_choice="auto",
+            text={"format": FINAL_RESPONSE_FORMAT},
+            max_output_tokens=700,
+        )
+
     try:
-        create_args = {
-            "model": OPENAI_MODEL,
-            "instructions": INSTRUCTIONS,
-            "input": [{"role": "user", "content": _external_context(data, prefetched_knowledge)}],
-            "tools": TOOLS,
-            "tool_choice": "auto",
-            "text": {"format": FINAL_RESPONSE_FORMAT},
-            "max_output_tokens": 700,
-        }
-        if data.previous_response_id:
-            create_args["previous_response_id"] = data.previous_response_id
-
         try:
-            response = client.responses.create(**create_args)
+            response = _create_response([
+                {"role": "user", "content": _external_context(data, prefetched_knowledge)}
+            ])
         except Exception:
-            # Si un hilo previo expiró o dejó de estar disponible, seguimos con los
-            # custom fields de ManyChat en vez de romper la conversación.
-            if not data.previous_response_id:
+            # Si ManyChat trae un conversation_id viejo/inválido, recuperamos creando uno nuevo.
+            # Esto evita repetir eternamente una pregunta por un ID roto.
+            if conversation_was_created:
                 raise
-            logger.warning("No se pudo continuar previous_response_id; reiniciando hilo", exc_info=True)
-            create_args.pop("previous_response_id", None)
-            response = client.responses.create(**create_args)
+            logger.warning("Conversation inválida/no disponible; creando una nueva", exc_info=True)
+            metadata = {"source": "manychat-sporthouse", "recovered": "true"}
+            if data.contact_id:
+                metadata["contact_id"] = str(data.contact_id)[:512]
+            conversation = client.conversations.create(metadata=metadata)
+            conversation_id = conversation.id
+            conversation_was_created = True
+            response = _create_response([
+                {"role": "user", "content": _external_context(data, prefetched_knowledge)}
+            ])
 
-        # El modelo puede encadenar varias herramientas en un mismo turno.
+        # El modelo puede encadenar varias herramientas en el mismo turno.
         for _ in range(6):
             function_calls = [
                 item for item in response.output
@@ -1708,6 +1747,9 @@ async def chat(data: ChatRequest):
                 )
                 result["tools_used"] = tools_used
                 result["knowledge_sources"] = list(dict.fromkeys(knowledge_sources))
+                result["conversation_id"] = conversation_id
+                # Conservamos response_id solo como diagnóstico/compatibilidad. No se usa como memoria principal.
+                result["response_id"] = response.id
                 return result
 
             tool_outputs = []
@@ -1769,24 +1811,16 @@ async def chat(data: ChatRequest):
                     "output": json.dumps(tool_result, ensure_ascii=False),
                 })
 
-            # Continuar exactamente el hilo generado por el modelo, incluyendo sus
-            # tool calls. El modelo recibe datos; él decide cómo interpretarlos y responder.
-            response = client.responses.create(
-                model=OPENAI_MODEL,
-                instructions=INSTRUCTIONS,
-                previous_response_id=response.id,
-                input=tool_outputs,
-                tools=TOOLS,
-                tool_choice="auto",
-                text={"format": FINAL_RESPONSE_FORMAT},
-                max_output_tokens=700,
-            )
+            # Como el response y los function calls ya forman parte de la misma Conversation,
+            # solo enviamos las salidas de herramientas y continuamos sobre conversation_id.
+            response = _create_response(tool_outputs)
 
         return {
             "reply": "Necesito que un asesor de SportHouse continúe contigo para revisar este caso.",
             **_fallback_context(data),
             "needs_human": True,
             "escalation_reason": "tool_loop_limit",
+            "conversation_id": conversation_id,
             "response_id": response.id,
             "tools_used": tools_used,
             "knowledge_sources": list(dict.fromkeys(knowledge_sources)),
@@ -1799,6 +1833,7 @@ async def chat(data: ChatRequest):
             **_fallback_context(data),
             "needs_human": True,
             "escalation_reason": "backend_error",
+            "conversation_id": conversation_id,
             "response_id": data.previous_response_id,
             "tools_used": tools_used,
             "knowledge_sources": list(dict.fromkeys(knowledge_sources)),
