@@ -7,10 +7,13 @@ import unicodedata, time, re
 import logging
 import requests
 from chatgpt_odoo_api import chatgpt_app
+from ai_chat import router as ai_chat_router
 
 app = FastAPI()
 
+# Conserva la integración existente y agrega el nuevo orquestador de IA.
 app.mount("/chatgpt", chatgpt_app)
+app.include_router(ai_chat_router)
 
 # 🔐 Variables de entorno
 ODOO_URL = os.getenv("ODOO_URL")
@@ -535,7 +538,7 @@ async def nlp_route(request: Request):
         return {"found": False, "intent": None, "msg": f"Error procesando NLP: {str(e)}"}
         
 
-MANYCHAT_API_KEY = "2663902:a54d0232e6fc431174e20594d5679c93"
+MANYCHAT_API_KEY = os.getenv("MANYCHAT_API_KEY", "")
 
 headers = {
     "Authorization": f"Bearer {MANYCHAT_API_KEY}",
