@@ -54,10 +54,120 @@ def _clean_html(value: str) -> str:
     return value.strip()
 
 
-def _phone10(value: Optional[str]) -> str:
-    digits = re.sub(r"\D", "", value or "")
-    return digits[-10:] if len(digits) >= 10 else digits
+def _normalize_order_number(value: Optional[str]):
+    """
+    Normaliza formatos comunes SIN inventar dígitos.
 
+    Reglas seguras acordadas:
+    - S02038 / s02038 / S 02038 / S-02038 / S#02038 -> S02038
+    - 02038 -> S02038
+    - 2038 -> S02038 (se completa únicamente el cero inicial del formato)
+    - S2038 -> S02038 (se completa únicamente el cero inicial del formato)
+    - SO2038 -> S02038 cuando la O está claramente ocupando el lugar de un 0
+    - S0203 -> NO se adivina: puede faltar un dígito en una posición desconocida
+    - S020388 -> NO se recorta: sobra información
+    - Si hay más de un candidato distinto, se pide aclaración.
+    """
+    raw = (value or "").strip()
+    if not raw:
+        return {"status": "missing_order_number"}
+
+    upper = raw.upper()
+    # Corrige únicamente la confusión obvia SO2038 -> S02038. No sustituimos
+    # letras O en posiciones arbitrarias.
+    upper_for_scan = re.sub(r"(?<![A-Z0-9])S[\s#\-]*O(?=\d)", "S0", upper)
+
+    # Detectar varios candidatos explícitos dentro de una frase.
+    # Ej.: "creo que es S02038 o S02039" -> no elegir por la mamá.
+    explicit_candidates = re.findall(
+        r"(?<![A-Z0-9])S[\s#\-]*[0-9](?:[\s#\-]*[0-9]){2,6}(?![A-Z0-9])",
+        upper_for_scan,
+    )
+    normalized_explicit = []
+    for candidate in explicit_candidates:
+        compact = re.sub(r"[\s#\-]", "", candidate)
+        if compact not in normalized_explicit:
+            normalized_explicit.append(compact)
+
+    if len(normalized_explicit) > 1:
+        return {
+            "status": "multiple_order_numbers",
+            "candidates": normalized_explicit,
+            "message": "Se detectó más de un número de pedido. Pide al cliente que confirme cuál desea consultar.",
+        }
+
+    # Si existe un candidato con S, úsalo. Si no, extrae bloques numéricos.
+    if normalized_explicit:
+        compact = normalized_explicit[0]
+        digits = compact[1:]
+        had_s_prefix = True
+    else:
+        numeric_groups = re.findall(r"(?<!\d)\d{3,7}(?!\d)", upper)
+        unique_groups = list(dict.fromkeys(numeric_groups))
+        if len(unique_groups) > 1:
+            return {
+                "status": "multiple_order_numbers",
+                "candidates": unique_groups,
+                "message": "Se detectó más de un número posible. Pide al cliente que confirme cuál es su pedido.",
+            }
+        if unique_groups:
+            digits = unique_groups[0]
+            had_s_prefix = False
+        else:
+            # Último intento: el valor podría ser solo el número ya limpio o una S compacta.
+            compact_raw = re.sub(r"[\s#\-]", "", upper)
+            if compact_raw.startswith("S"):
+                tail = compact_raw[1:]
+                # Corregir O->0 solo cuando todo lo demás son dígitos.
+                if tail and all(ch.isdigit() or ch == "O" for ch in tail):
+                    digits = tail.replace("O", "0")
+                    had_s_prefix = True
+                else:
+                    return {"status": "invalid_order_number", "raw": raw}
+            elif compact_raw.isdigit():
+                digits = compact_raw
+                had_s_prefix = False
+            else:
+                return {"status": "invalid_order_number", "raw": raw}
+
+    if not digits.isdigit():
+        return {"status": "invalid_order_number", "raw": raw}
+
+    # Formato canónico actual: S + 5 dígitos.
+    if len(digits) == 5:
+        return {
+            "status": "ok",
+            "normalized": f"S{digits}",
+            "raw": raw,
+        }
+
+    if len(digits) == 4:
+        # 2038 / S2038: es seguro completar solo el cero inicial esperado.
+        # S0203: ya empieza en 0; falta un dígito en una posición desconocida y no se adivina.
+        if not digits.startswith("0"):
+            return {
+                "status": "ok",
+                "normalized": f"S0{digits}",
+                "raw": raw,
+            }
+        return {
+            "status": "incomplete_order_number",
+            "raw": raw,
+            "message": "El número parece incompleto. El formato esperado es S00000 y no es seguro adivinar el dígito faltante.",
+        }
+
+    if len(digits) < 4:
+        return {
+            "status": "incomplete_order_number",
+            "raw": raw,
+            "message": "El número parece incompleto. El formato esperado es S00000.",
+        }
+
+    return {
+        "status": "invalid_order_number",
+        "raw": raw,
+        "message": "El número no tiene el formato esperado S00000. No recortes ni sustituyas dígitos automáticamente.",
+    }
 
 def _odoo():
     missing = [
@@ -81,47 +191,40 @@ def _odoo():
 
 
 def _find_order(models, uid, order_number: str):
-    raw = (order_number or "").strip()
-    if not raw:
-        return {"status": "missing_order_number"}
+    parsed = _normalize_order_number(order_number)
+    if parsed.get("status") != "ok":
+        return parsed
 
+    normalized = parsed["normalized"]
     fields = [
         "id", "name", "partner_id", "date_order", "amount_total", "website_id"
     ]
 
-    # Primero coincidencia exacta.
+    # Solo buscamos el número ya normalizado. No hacemos fuzzy matching ni
+    # cambiamos dígitos si no existe, porque podríamos terminar consultando otro pedido.
     orders = models.execute_kw(
         ODOO_DB, uid, ODOO_PASSWORD,
         "sale.order", "search_read",
-        [[["name", "=", raw]]],
+        [[["name", "=", normalized]]],
         {"fields": fields, "limit": 2}
     )
 
-    # Si la mamá escribió solo la parte numérica, intentamos una coincidencia
-    # controlada. Solo aceptamos el resultado si es único.
-    if not orders and raw.isdigit():
-        candidates = models.execute_kw(
-            ODOO_DB, uid, ODOO_PASSWORD,
-            "sale.order", "search_read",
-            [[["name", "ilike", raw]]],
-            {"fields": fields, "limit": 5, "order": "id desc"}
-        )
-        if len(candidates) == 1:
-            orders = candidates
-        elif len(candidates) > 1:
-            return {
-                "status": "ambiguous_order_number",
-                "message": "El número escrito coincide con más de un pedido. Solicita el número completo tal como aparece en la confirmación."
-            }
-
     if not orders:
-        return {"status": "not_found", "order_number": raw}
+        return {
+            "status": "not_found",
+            "order_number": normalized,
+            "raw_order_number": parsed.get("raw"),
+            "message": "No se encontró ese pedido. Pide verificar el número sin proponer ni adivinar otros dígitos.",
+        }
 
-    return {"status": "ok", "order": orders[0]}
+    return {
+        "status": "ok",
+        "order": orders[0],
+        "normalized_order_number": normalized,
+    }
 
-
-def consultar_pedido(school: str, order_number: str, phone: Optional[str]):
-    """Consulta un pedido y valida escuela + teléfono antes de devolver información."""
+def consultar_pedido(school: str, order_number: str):
+    """Consulta un pedido y valida que corresponda a la escuela indicada."""
     uid, models = _odoo()
     found = _find_order(models, uid, order_number)
     if found.get("status") != "ok":
@@ -154,20 +257,6 @@ def consultar_pedido(school: str, order_number: str, phone: Optional[str]):
             {"fields": ["name", "phone"]}
         )
         partner_data = partners[0] if partners else None
-
-    # WhatsApp ya conoce el teléfono. Si se recibió, lo usamos como segunda
-    # validación para evitar que alguien pruebe números de pedido ajenos.
-    if phone and partner_data:
-        incoming = _phone10(phone)
-        candidate_phones = {
-            _phone10(partner_data.get("phone")),
-        }
-        candidate_phones.discard("")
-        if candidate_phones and incoming not in candidate_phones:
-            return {
-                "status": "identity_mismatch",
-                "message": "El teléfono de WhatsApp no coincide con el registrado en el pedido. No muestres datos del pedido y deriva a un asesor."
-            }
 
     pickings = models.execute_kw(
         ODOO_DB, uid, ODOO_PASSWORD,
@@ -270,8 +359,9 @@ TOOLS = [
         "type": "function",
         "name": "consultar_pedido",
         "description": (
-            "Consulta en Odoo el estado real de un pedido. Solo úsala cuando ya "
-            "conozcas con seguridad la escuela y el número de pedido."
+            "Consulta en Odoo el estado real de un pedido. Úsala cuando ya "
+            "conozcas la escuela y el cliente haya proporcionado un posible número de pedido; "
+            "el backend normaliza formatos comunes sin inventar dígitos."
         ),
         "parameters": {
             "type": "object",
@@ -343,10 +433,17 @@ PEDIDOS
 Para consultar un pedido necesitas escuela + número de pedido.
 - Si falta escuela, pídela primero.
 - Si falta número de pedido, pídelo de forma natural.
-- Cuando tengas ambos, llama consultar_pedido.
+- Las mamás pueden escribir el número con formatos raros: minúsculas, espacios, guiones,
+  sin la S, o dentro de una frase. No les exijas una sintaxis perfecta.
+- Cuando tengas escuela y un posible número, llama consultar_pedido. El backend se encarga
+  de normalizar formatos seguros.
+- Nunca inventes, sustituyas, recortes ni reordenes dígitos.
+- Si consultar_pedido responde incomplete_order_number o invalid_order_number, explica de
+  forma breve que el formato esperado es S00000 y pide que confirme el número.
+- Si responde multiple_order_numbers, pregunta cuál de los números desea consultar.
+- Si responde not_found, pide verificar el número. No propongas otro número parecido.
 - Nunca inventes estatus, fecha ni datos del pedido.
-- Si la herramienta indica school_mismatch o identity_mismatch, no reveles ningún dato y
-  deriva a un asesor.
+- Si la herramienta indica school_mismatch, no reveles ningún dato y deriva a un asesor.
 
 FAQ / INFORMACIÓN
 Cuando la pregunta sea sobre políticas, tiempos, lugares, cambios, guías, compra u otra
@@ -483,9 +580,8 @@ MENSAJE ACTUAL DEL CLIENTE:
                     result = consultar_pedido(
                         school=args.get("school") or context.get("school"),
                         order_number=args.get("order_number") or context.get("order_number"),
-                        phone=data.phone,
                     )
-                    if result.get("status") in {"identity_mismatch", "school_mismatch"}:
+                    if result.get("status") in {"school_mismatch"}:
                         needs_human = True
                         escalation_reason = result.get("status")
 
