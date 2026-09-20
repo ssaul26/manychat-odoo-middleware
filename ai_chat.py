@@ -28,12 +28,16 @@ class ChatRequest(BaseModel):
     phone: Optional[str] = None
     first_name: Optional[str] = None
 
-    # Contexto que ManyChat guardará y reenviará en cada turno.
+    # Contexto durable que ManyChat puede guardar como custom fields.
     school: Optional[str] = None
     order_number: Optional[str] = None
     product: Optional[str] = None
     size: Optional[str] = None
     intent: Optional[str] = None
+
+    # Permite que OpenAI conserve el hilo conversacional completo entre turnos.
+    # ManyChat podrá guardar este valor y reenviarlo en el siguiente mensaje.
+    previous_response_id: Optional[str] = None
 
 
 def _norm(value: Optional[str]) -> str:
@@ -53,121 +57,6 @@ def _clean_html(value: str) -> str:
     value = re.sub(r"\n{3,}", "\n\n", value)
     return value.strip()
 
-
-def _normalize_order_number(value: Optional[str]):
-    """
-    Normaliza formatos comunes SIN inventar dígitos.
-
-    Reglas seguras acordadas:
-    - S02038 / s02038 / S 02038 / S-02038 / S#02038 -> S02038
-    - 02038 -> S02038
-    - 2038 -> S02038 (se completa únicamente el cero inicial del formato)
-    - S2038 -> S02038 (se completa únicamente el cero inicial del formato)
-    - SO2038 -> S02038 cuando la O está claramente ocupando el lugar de un 0
-    - S0203 -> NO se adivina: puede faltar un dígito en una posición desconocida
-    - S020388 -> NO se recorta: sobra información
-    - Si hay más de un candidato distinto, se pide aclaración.
-    """
-    raw = (value or "").strip()
-    if not raw:
-        return {"status": "missing_order_number"}
-
-    upper = raw.upper()
-    # Corrige únicamente la confusión obvia SO2038 -> S02038. No sustituimos
-    # letras O en posiciones arbitrarias.
-    upper_for_scan = re.sub(r"(?<![A-Z0-9])S[\s#\-]*O(?=\d)", "S0", upper)
-
-    # Detectar varios candidatos explícitos dentro de una frase.
-    # Ej.: "creo que es S02038 o S02039" -> no elegir por la mamá.
-    explicit_candidates = re.findall(
-        r"(?<![A-Z0-9])S[\s#\-]*[0-9](?:[\s#\-]*[0-9]){2,6}(?![A-Z0-9])",
-        upper_for_scan,
-    )
-    normalized_explicit = []
-    for candidate in explicit_candidates:
-        compact = re.sub(r"[\s#\-]", "", candidate)
-        if compact not in normalized_explicit:
-            normalized_explicit.append(compact)
-
-    if len(normalized_explicit) > 1:
-        return {
-            "status": "multiple_order_numbers",
-            "candidates": normalized_explicit,
-            "message": "Se detectó más de un número de pedido. Pide al cliente que confirme cuál desea consultar.",
-        }
-
-    # Si existe un candidato con S, úsalo. Si no, extrae bloques numéricos.
-    if normalized_explicit:
-        compact = normalized_explicit[0]
-        digits = compact[1:]
-        had_s_prefix = True
-    else:
-        numeric_groups = re.findall(r"(?<!\d)\d{3,7}(?!\d)", upper)
-        unique_groups = list(dict.fromkeys(numeric_groups))
-        if len(unique_groups) > 1:
-            return {
-                "status": "multiple_order_numbers",
-                "candidates": unique_groups,
-                "message": "Se detectó más de un número posible. Pide al cliente que confirme cuál es su pedido.",
-            }
-        if unique_groups:
-            digits = unique_groups[0]
-            had_s_prefix = False
-        else:
-            # Último intento: el valor podría ser solo el número ya limpio o una S compacta.
-            compact_raw = re.sub(r"[\s#\-]", "", upper)
-            if compact_raw.startswith("S"):
-                tail = compact_raw[1:]
-                # Corregir O->0 solo cuando todo lo demás son dígitos.
-                if tail and all(ch.isdigit() or ch == "O" for ch in tail):
-                    digits = tail.replace("O", "0")
-                    had_s_prefix = True
-                else:
-                    return {"status": "invalid_order_number", "raw": raw}
-            elif compact_raw.isdigit():
-                digits = compact_raw
-                had_s_prefix = False
-            else:
-                return {"status": "invalid_order_number", "raw": raw}
-
-    if not digits.isdigit():
-        return {"status": "invalid_order_number", "raw": raw}
-
-    # Formato canónico actual: S + 5 dígitos.
-    if len(digits) == 5:
-        return {
-            "status": "ok",
-            "normalized": f"S{digits}",
-            "raw": raw,
-        }
-
-    if len(digits) == 4:
-        # 2038 / S2038: es seguro completar solo el cero inicial esperado.
-        # S0203: ya empieza en 0; falta un dígito en una posición desconocida y no se adivina.
-        if not digits.startswith("0"):
-            return {
-                "status": "ok",
-                "normalized": f"S0{digits}",
-                "raw": raw,
-            }
-        return {
-            "status": "incomplete_order_number",
-            "raw": raw,
-            "message": "El número parece incompleto. El formato esperado es S00000 y no es seguro adivinar el dígito faltante.",
-        }
-
-    if len(digits) < 4:
-        return {
-            "status": "incomplete_order_number",
-            "raw": raw,
-            "message": "El número parece incompleto. El formato esperado es S00000.",
-        }
-
-    return {
-        "status": "invalid_order_number",
-        "raw": raw,
-        "message": "El número no tiene el formato esperado S00000. No recortes ni sustituyas dígitos automáticamente.",
-    }
 
 def _odoo():
     missing = [
@@ -190,116 +79,109 @@ def _odoo():
     return uid, models
 
 
-def _find_order(models, uid, order_number: str):
-    parsed = _normalize_order_number(order_number)
-    if parsed.get("status") != "ok":
-        return parsed
+def consultar_pedido(school: str, order_number: str):
+    """
+    Herramienta deliberadamente simple.
 
-    normalized = parsed["normalized"]
-    fields = [
-        "id", "name", "partner_id", "date_order", "amount_total", "website_id"
-    ]
+    La IA interpreta el lenguaje del cliente y solo llama esta función cuando ya
+    decidió cuál es la escuela y cuál es el número canónico del pedido.
+    Esta función NO adivina dígitos ni elige entre números ambiguos.
+    """
+    school = (school or "").strip()
+    order_number = re.sub(r"[\s#\-]", "", (order_number or "").upper())
 
-    # Solo buscamos el número ya normalizado. No hacemos fuzzy matching ni
-    # cambiamos dígitos si no existe, porque podríamos terminar consultando otro pedido.
+    if not school:
+        return {
+            "status": "missing_school",
+            "message": "Falta la escuela. Pregunta al cliente antes de consultar el pedido.",
+        }
+
+    # Única validación de integridad: Odoo usa S + 5 dígitos.
+    # La interpretación de lo que quiso decir el cliente corresponde a la IA.
+    if not re.fullmatch(r"S\d{5}", order_number):
+        return {
+            "status": "invalid_format",
+            "received": order_number,
+            "expected_format": "S00000",
+            "message": "El número todavía no está en formato canónico. No adivines si hay ambigüedad.",
+        }
+
+    uid, models = _odoo()
+
     orders = models.execute_kw(
         ODOO_DB, uid, ODOO_PASSWORD,
         "sale.order", "search_read",
-        [[["name", "=", normalized]]],
-        {"fields": fields, "limit": 2}
+        [[["name", "=", order_number]]],
+        {
+            "fields": ["id", "name", "website_id"],
+            "limit": 1,
+        },
     )
 
     if not orders:
         return {
             "status": "not_found",
-            "order_number": normalized,
-            "raw_order_number": parsed.get("raw"),
-            "message": "No se encontró ese pedido. Pide verificar el número sin proponer ni adivinar otros dígitos.",
+            "order_number": order_number,
+            "message": "No existe un pedido con ese número exacto. Pide al cliente verificarlo; no propongas otro número.",
         }
 
-    return {
-        "status": "ok",
-        "order": orders[0],
-        "normalized_order_number": normalized,
-    }
-
-def consultar_pedido(school: str, order_number: str):
-    """Consulta un pedido y valida que corresponda a la escuela indicada."""
-    uid, models = _odoo()
-    found = _find_order(models, uid, order_number)
-    if found.get("status") != "ok":
-        return found
-
-    order = found["order"]
+    order = orders[0]
     website = order.get("website_id")
     website_name = website[1] if website else ""
 
-    if not school:
-        return {"status": "missing_school"}
-
+    # Regla de integridad de negocio: nunca mezclar escuelas.
     school_norm = _norm(school)
     website_norm = _norm(website_name)
     if not website_norm or school_norm not in website_norm:
         return {
             "status": "school_mismatch",
-            "message": "El pedido no corresponde a la escuela indicada o no fue posible validarla. No muestres datos del pedido."
+            "order_number": order_number,
+            "message": "El pedido no corresponde a la escuela indicada. No reveles información del pedido.",
         }
-
-    partner = order.get("partner_id")
-    partner_id = partner[0] if partner else None
-    partner_data = None
-
-    if partner_id:
-        partners = models.execute_kw(
-            ODOO_DB, uid, ODOO_PASSWORD,
-            "res.partner", "read",
-            [[partner_id]],
-            {"fields": ["name", "phone"]}
-        )
-        partner_data = partners[0] if partners else None
 
     pickings = models.execute_kw(
         ODOO_DB, uid, ODOO_PASSWORD,
         "stock.picking", "search_read",
-        [[[
-            "origin", "=", order.get("name")
-        ]]],
+        [[["origin", "=", order_number]]],
         {
-            "fields": [
-                "name", "state", "scheduled_date", "x_studio_estado_sporthouse"
-            ],
+            "fields": ["state", "x_studio_estado_sporthouse"],
             "limit": 1,
             "order": "id desc",
-        }
+        },
     )
 
     picking = pickings[0] if pickings else {}
+
     return {
         "status": "ok",
-        "order_number": order.get("name"),
+        "order_number": order_number,
         "school": school,
-        "customer_first_name": (partner_data or {}).get("name"),
         "sporthouse_status": picking.get("x_studio_estado_sporthouse") or None,
-        "odoo_picking_state": picking.get("state") or None,
-        "scheduled_date": picking.get("scheduled_date") or None,
+        "internal_delivery_state": picking.get("state") or None,
     }
 
 
 def buscar_info_escuela(school: str, query: str):
-    """Trae conocimiento de Odoo de la escuela; la IA decide qué fragmento responde."""
+    """Devuelve conocimiento de Odoo; la IA decide qué parte responde la pregunta."""
+    school = (school or "").strip()
+    query = (query or "").strip()
+
     if not school:
-        return {"status": "missing_school"}
+        return {
+            "status": "missing_school",
+            "message": "Falta la escuela. Pregunta al cliente antes de buscar información específica.",
+        }
 
     uid, models = _odoo()
     articles = models.execute_kw(
         ODOO_DB, uid, ODOO_PASSWORD,
         "knowledge.article", "search_read",
-        [[["name", "ilike", school]]],
+        [[['name', 'ilike', school]]],
         {
             "fields": ["name", "body"],
             "order": "name asc",
             "limit": 10,
-        }
+        },
     )
 
     if not articles:
@@ -307,7 +189,7 @@ def buscar_info_escuela(school: str, query: str):
             "status": "not_found",
             "school": school,
             "query": query,
-            "message": "No hay información de conocimiento localizada para esa escuela."
+            "message": "No se encontró información de conocimiento para esa escuela.",
         }
 
     cleaned = []
@@ -316,7 +198,6 @@ def buscar_info_escuela(school: str, query: str):
         text = _clean_html(article.get("body") or "")
         if not text:
             continue
-        # Evita enviar artículos enormes en un solo turno.
         remaining = max(0, 14000 - total_chars)
         if remaining <= 0:
             break
@@ -332,42 +213,36 @@ def buscar_info_escuela(school: str, query: str):
     }
 
 
+def escalar_asesor(reason: str):
+    """Marca el caso para que ManyChat pueda enviarlo después a atención humana."""
+    return {
+        "status": "ok",
+        "needs_human": True,
+        "reason": (reason or "El caso requiere revisión humana.").strip(),
+    }
+
+
 TOOLS = [
-    {
-        "type": "function",
-        "name": "guardar_contexto",
-        "description": (
-            "Guarda datos que el cliente acaba de proporcionar o aclarar. "
-            "Úsala cada vez que identifiques con seguridad escuela, número de pedido, "
-            "producto, talla o intención. Nunca inventes valores."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "school": {"type": ["string", "null"]},
-                "order_number": {"type": ["string", "null"]},
-                "product": {"type": ["string", "null"]},
-                "size": {"type": ["string", "null"]},
-                "intent": {"type": ["string", "null"]},
-            },
-            "required": ["school", "order_number", "product", "size", "intent"],
-            "additionalProperties": False,
-        },
-        "strict": True,
-    },
     {
         "type": "function",
         "name": "consultar_pedido",
         "description": (
-            "Consulta en Odoo el estado real de un pedido. Úsala cuando ya "
-            "conozcas la escuela y el cliente haya proporcionado un posible número de pedido; "
-            "el backend normaliza formatos comunes sin inventar dígitos."
+            "Consulta en Odoo un pedido real. Llámala únicamente cuando conozcas la escuela "
+            "y hayas resuelto con suficiente confianza un único número de pedido en formato S00000. "
+            "No la llames si el cliente dio varios números, cree que le falta un dígito o existe ambigüedad: "
+            "en esos casos conversa y pide aclaración primero."
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "school": {"type": "string"},
-                "order_number": {"type": "string"},
+                "school": {
+                    "type": "string",
+                    "description": "Escuela confirmada por el cliente o ya conocida en el contexto.",
+                },
+                "order_number": {
+                    "type": "string",
+                    "description": "Número canónico único, por ejemplo S02038.",
+                },
             },
             "required": ["school", "order_number"],
             "additionalProperties": False,
@@ -378,14 +253,20 @@ TOOLS = [
         "type": "function",
         "name": "buscar_info_escuela",
         "description": (
-            "Busca FAQs, políticas, enlaces, tiempos y demás conocimiento de una "
-            "escuela en Odoo. Requiere escuela conocida. No sirve para inventario."
+            "Busca en Odoo FAQs, políticas, links, tiempos, guías, lugares, cambios y otra información "
+            "específica de una escuela. No sirve para inventario ni para consultar pedidos."
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "school": {"type": "string"},
-                "query": {"type": "string"},
+                "school": {
+                    "type": "string",
+                    "description": "Escuela confirmada del cliente.",
+                },
+                "query": {
+                    "type": "string",
+                    "description": "Qué información necesitas encontrar para responder al cliente.",
+                },
             },
             "required": ["school", "query"],
             "additionalProperties": False,
@@ -395,7 +276,10 @@ TOOLS = [
     {
         "type": "function",
         "name": "escalar_asesor",
-        "description": "Marca que la conversación debe pasar a una persona de SportHouse.",
+        "description": (
+            "Marca que un asesor humano debe continuar. Úsala cuando la información disponible no alcance, "
+            "la herramienta indique que no se puede validar de forma segura, o el cliente pida hablar con una persona."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
@@ -409,86 +293,172 @@ TOOLS = [
 ]
 
 
+FINAL_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "name": "sporthouse_chat_response",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "properties": {
+            "reply": {
+                "type": "string",
+                "description": "Mensaje final natural y breve que se enviará al cliente por WhatsApp.",
+            },
+            "school": {
+                "type": ["string", "null"],
+                "description": "Escuela actualmente confirmada; conserva la anterior si no cambió.",
+            },
+            "order_number": {
+                "type": ["string", "null"],
+                "description": "Pedido actualmente confirmado, preferentemente en formato S00000. Null si no está confirmado.",
+            },
+            "product": {
+                "type": ["string", "null"],
+                "description": "Producto del que se está hablando, si quedó claro.",
+            },
+            "size": {
+                "type": ["string", "null"],
+                "description": "Talla mencionada/confirmada, si aplica.",
+            },
+            "intent": {
+                "type": ["string", "null"],
+                "description": "Descripción corta de la necesidad actual del cliente; no tiene que pertenecer a un catálogo fijo.",
+            },
+            "needs_human": {
+                "type": "boolean",
+                "description": "True solo cuando el caso realmente debe pasar a una persona.",
+            },
+            "escalation_reason": {
+                "type": ["string", "null"],
+                "description": "Razón interna breve si needs_human=true; no tiene que mostrarse al cliente.",
+            },
+        },
+        "required": [
+            "reply", "school", "order_number", "product", "size", "intent",
+            "needs_human", "escalation_reason"
+        ],
+        "additionalProperties": False,
+    },
+}
+
+
 INSTRUCTIONS = """
-Eres el asistente virtual de SportHouse en WhatsApp.
+Eres el asistente conversacional de SportHouse para WhatsApp.
 
-OBJETIVO
-Entiende mensajes naturales, incompletos, informales, con errores o escritos de formas
-inusuales. No dependas de palabras clave. Responde breve, amable y natural.
+PRINCIPIO CENTRAL
+Tú eres quien entiende la conversación. Las mamás pueden preguntar de cualquier manera: con errores,
+abreviaciones, mensajes incompletos, varios temas a la vez, referencias como "ese", "el primero",
+frases poco claras o números escritos de forma informal. No uses un árbol rígido de intenciones ni esperes
+palabras exactas. Interpreta la conversación completa y decide qué necesitas preguntar, qué herramienta usar
+y cómo responder.
 
-REGLA CRÍTICA: ESCUELA
-SportHouse atiende muchas escuelas y puede haber productos con el mismo nombre en
-varias de ellas. La escuela es obligatoria antes de responder cualquier dato que dependa
-de catálogo, productos, inventario, talla, precio, guía de tallas, política específica,
-entrega, FAQ específica o pedido.
-
-- Nunca infieras una escuela a partir del nombre de una prenda.
-- Si la escuela ya viene en CONTEXTO ACTUAL, úsala y no la vuelvas a preguntar.
-- Si el cliente menciona claramente una escuela nueva, llama guardar_contexto.
-- Si la pregunta depende de escuela y no la conoces, pregunta únicamente de qué escuela
-  necesita información. No consultes herramientas todavía.
-- Nunca mezcles información de dos escuelas.
+ESCUELAS
+SportHouse atiende muchas escuelas y existen productos iguales o parecidos entre ellas. Para cualquier dato
+que dependa de catálogo, producto, inventario, talla, precio, guía, política, entrega, FAQ o pedido debes
+conocer primero la escuela. Nunca adivines la escuela por una prenda. Si no está clara, pregúntala de forma
+natural. Si ya está confirmada en la conversación o en CONTEXTO EXTERNO, no la vuelvas a pedir. Si el cliente
+cambia de escuela explícitamente, actualiza el contexto.
 
 PEDIDOS
-Para consultar un pedido necesitas escuela + número de pedido.
-- Si falta escuela, pídela primero.
-- Si falta número de pedido, pídelo de forma natural.
-- Las mamás pueden escribir el número con formatos raros: minúsculas, espacios, guiones,
-  sin la S, o dentro de una frase. No les exijas una sintaxis perfecta.
-- Cuando tengas escuela y un posible número, llama consultar_pedido. El backend se encarga
-  de normalizar formatos seguros.
-- Nunca inventes, sustituyas, recortes ni reordenes dígitos.
-- Si consultar_pedido responde incomplete_order_number o invalid_order_number, explica de
-  forma breve que el formato esperado es S00000 y pide que confirme el número.
-- Si responde multiple_order_numbers, pregunta cuál de los números desea consultar.
-- Si responde not_found, pide verificar el número. No propongas otro número parecido.
-- Nunca inventes estatus, fecha ni datos del pedido.
-- Si la herramienta indica school_mismatch, no reveles ningún dato y deriva a un asesor.
+El formato canónico de SportHouse es S + 5 dígitos, por ejemplo S02038. El cliente NO tiene que escribirlo
+perfectamente. Tú puedes comprender variantes de escritura y convertirlas al formato canónico cuando sea
+inequívoco. Ejemplos de transformación inequívoca pueden ser mayúsculas/minúsculas, espacios, guiones,
+una S omitida o un cero inicial omitido cuando el resto identifica claramente el mismo número.
 
-FAQ / INFORMACIÓN
-Cuando la pregunta sea sobre políticas, tiempos, lugares, cambios, guías, compra u otra
-información específica de una escuela, usa buscar_info_escuela después de conocer la escuela.
-Responde únicamente con lo que la herramienta encuentre. Si no encuentra respuesta,
-deriva a un asesor.
+La regla no es memorizar ejemplos: usa criterio conversacional.
+- Si hay un único número inequívoco y conoces la escuela, llama consultar_pedido con S00000.
+- Si hay varios números posibles, no elijas por el cliente: pregunta cuál quiere revisar.
+- Si el cliente dice o sugiere que falta/sobra un dígito, o no puedes reconstruir un único S00000 con confianza,
+  no inventes: pide que lo confirme.
+- Si un número canónico no existe, pide verificarlo. No cambies dígitos para encontrar otro pedido.
+- Si consultar_pedido devuelve school_mismatch, no reveles el estado ni otros datos del pedido.
+- No necesitas validar el teléfono del cliente contra Odoo.
+- Para responder estatus usa principalmente sporthouse_status. internal_delivery_state es un dato interno y
+  no debe sustituir ni reinterpretar el Estado SportHouse ante el cliente.
 
-PRODUCTOS / INVENTARIO
-La consulta de inventario por variante todavía no está habilitada en esta versión. Puedes
-entender y guardar escuela, producto y talla. Nunca afirmes que hay o no hay existencia.
-Si el cliente necesita disponibilidad real y ya reuniste los datos necesarios, llama
-escalar_asesor indicando que falta la consulta de inventario por variante.
+FAQ E INFORMACIÓN
+Si la pregunta es sobre políticas, tiempos, formas de compra, ubicaciones, cambios, guías, links u otra
+información específica de una escuela, usa buscar_info_escuela una vez que la escuela esté clara. Responde
+solo con información respaldada por esa herramienta. Si no aparece la respuesta, puedes escalar a asesor.
 
-CONTEXTO
-Cuando el cliente proporcione o aclare escuela, pedido, producto, talla o intención, llama
-guardar_contexto para que ManyChat pueda conservarlo para el siguiente mensaje.
-No borres un dato de contexto salvo que el cliente explícitamente lo cambie.
+PRODUCTOS E INVENTARIO
+Todavía NO existe una herramienta de inventario por variante en esta versión. Puedes entender y conservar
+escuela, producto y talla, pero nunca afirmes disponibilidad real. Si la persona necesita confirmar stock,
+explícalo de forma natural y marca el caso para asesor con escalar_asesor. Más adelante se añadirá la herramienta.
+
+VARIOS TEMAS EN EL MISMO MENSAJE
+No fuerces una sola intención. Si una mamá pregunta dos o más cosas, resuelve todas las que puedas. Puedes
+usar más de una herramienta en el mismo turno. Si necesitas una aclaración que bloquea solo una parte,
+puedes responder la otra parte y preguntar lo que falta.
+
+CONTEXTO Y MEMORIA
+Recibirás CONTEXTO EXTERNO con escuela/pedido/producto/talla que ManyChat haya guardado. También puedes
+recibir el historial del hilo mediante previous_response_id. Conserva en tu salida los datos ya confirmados,
+salvo que el cliente los corrija o cambie explícitamente. No guardes como definitivo un dato que tú mismo
+consideras ambiguo.
+
+ESCALAMIENTO
+No digas "ya te pasé con un asesor" a menos que realmente hayas llamado escalar_asesor. Si lo llamas,
+puedes decir que un asesor continuará o revisará el caso. No escales solo porque el cliente escribió raro:
+primero conversa y aclara cuando sea razonable.
 
 ESTILO
 - Español por defecto.
-- WhatsApp: breve, humano y claro.
+- Breve, amable y natural, como una buena atención por WhatsApp.
 - Emojis moderados.
-- No menciones OpenAI, ChatGPT, Odoo, APIs, prompts, herramientas ni sistemas internos.
-- No inventes información.
-- No obligues al cliente a usar menús o frases exactas.
+- Para negritas de WhatsApp usa *texto*, no **texto**.
+- No menciones OpenAI, ChatGPT, Odoo, APIs, prompts, funciones ni herramientas.
+- Nunca inventes precios, inventario, estatus, fechas, políticas, links ni datos de otra escuela.
+
+SALIDA
+Tu respuesta final debe seguir el esquema estructurado recibido. `reply` es exactamente lo que verá el cliente.
+Los demás campos son contexto operativo para conservar la conversación.
 """.strip()
 
 
-def _initial_context(data: ChatRequest):
+def _external_context(data: ChatRequest) -> str:
+    return f"""
+CONTEXTO EXTERNO ACTUAL (puede contener valores vacíos):
+- escuela confirmada: {data.school or 'NO CONOCIDA'}
+- pedido confirmado: {data.order_number or 'NO CONOCIDO'}
+- producto: {data.product or 'NO CONOCIDO'}
+- talla: {data.size or 'NO CONOCIDA'}
+- necesidad/intención previa: {data.intent or 'NO CONOCIDA'}
+- nombre del cliente: {data.first_name or 'NO DISPONIBLE'}
+
+MENSAJE NUEVO DEL CLIENTE:
+{data.message.strip()}
+""".strip()
+
+
+def _fallback_context(data: ChatRequest):
     return {
-        "school": data.school,
-        "order_number": data.order_number,
-        "product": data.product,
-        "size": data.size,
-        "intent": data.intent,
+        "school": data.school or None,
+        "order_number": data.order_number or None,
+        "product": data.product or None,
+        "size": data.size or None,
+        "intent": data.intent or None,
     }
 
 
-def _merge_context(context: dict, updates: dict):
+def _parse_final_response(response, data: ChatRequest, needs_human_from_tool=False, escalation_reason_from_tool=None):
+    raw = (response.output_text or "").strip()
+    parsed = json.loads(raw)
+
+    # El modelo administra el contexto. Solo usamos el contexto previo como fallback
+    # si por alguna razón un campo viene vacío sin que se haya confirmado un reemplazo.
+    previous = _fallback_context(data)
     for key in ("school", "order_number", "product", "size", "intent"):
-        value = updates.get(key)
-        if isinstance(value, str):
-            value = value.strip()
-        if value not in (None, ""):
-            context[key] = value
+        if parsed.get(key) in (None, "") and previous.get(key):
+            parsed[key] = previous[key]
+
+    if needs_human_from_tool:
+        parsed["needs_human"] = True
+        if not parsed.get("escalation_reason"):
+            parsed["escalation_reason"] = escalation_reason_from_tool
+
+    parsed["response_id"] = response.id
+    return parsed
 
 
 @router.post("/chat")
@@ -496,74 +466,70 @@ async def chat(data: ChatRequest):
     if not data.message or not data.message.strip():
         return {
             "reply": "¿En qué puedo ayudarte? 😊",
-            **_initial_context(data),
+            **_fallback_context(data),
             "needs_human": False,
+            "escalation_reason": None,
+            "response_id": data.previous_response_id,
             "tools_used": [],
         }
 
     if not OPENAI_API_KEY:
         return {
-            "reply": "En este momento no puedo procesar tu mensaje. Un asesor de SportHouse te ayudará.",
-            **_initial_context(data),
+            "reply": "En este momento no puedo procesar tu mensaje. Un asesor de SportHouse puede ayudarte.",
+            **_fallback_context(data),
             "needs_human": True,
-            "error": "OPENAI_API_KEY no configurada",
+            "escalation_reason": "openai_not_configured",
+            "response_id": data.previous_response_id,
             "tools_used": [],
         }
 
     client = OpenAI(api_key=OPENAI_API_KEY)
-    context = _initial_context(data)
-    needs_human = False
-    escalation_reason = None
     tools_used = []
-
-    user_input = f"""
-CONTEXTO ACTUAL (puede tener valores vacíos):
-- escuela: {context.get('school') or 'NO CONOCIDA'}
-- número de pedido: {context.get('order_number') or 'NO CONOCIDO'}
-- producto: {context.get('product') or 'NO CONOCIDO'}
-- talla: {context.get('size') or 'NO CONOCIDA'}
-- intención previa: {context.get('intent') or 'NO CONOCIDA'}
-- nombre del cliente: {data.first_name or 'NO DISPONIBLE'}
-
-MENSAJE ACTUAL DEL CLIENTE:
-{data.message.strip()}
-""".strip()
+    needs_human_from_tool = False
+    escalation_reason_from_tool = None
 
     try:
-        input_items = [{"role": "user", "content": user_input}]
+        create_args = {
+            "model": OPENAI_MODEL,
+            "instructions": INSTRUCTIONS,
+            "input": [{"role": "user", "content": _external_context(data)}],
+            "tools": TOOLS,
+            "tool_choice": "auto",
+            "text": {"format": FINAL_RESPONSE_FORMAT},
+            "max_output_tokens": 700,
+        }
+        if data.previous_response_id:
+            create_args["previous_response_id"] = data.previous_response_id
 
-        for _ in range(5):
-            response = client.responses.create(
-                model=OPENAI_MODEL,
-                instructions=INSTRUCTIONS,
-                input=input_items,
-                tools=TOOLS,
-                tool_choice="auto",
-                max_output_tokens=500,
-            )
+        try:
+            response = client.responses.create(**create_args)
+        except Exception:
+            # Si un hilo previo expiró o dejó de estar disponible, seguimos con los
+            # custom fields de ManyChat en vez de romper la conversación.
+            if not data.previous_response_id:
+                raise
+            logger.warning("No se pudo continuar previous_response_id; reiniciando hilo", exc_info=True)
+            create_args.pop("previous_response_id", None)
+            response = client.responses.create(**create_args)
 
+        # El modelo puede encadenar varias herramientas en un mismo turno.
+        for _ in range(6):
             function_calls = [
                 item for item in response.output
                 if getattr(item, "type", None) == "function_call"
             ]
 
             if not function_calls:
-                reply = (response.output_text or "").strip()
-                if not reply:
-                    reply = "¿Me das un poco más de información para ayudarte? 😊"
-                return {
-                    "reply": reply,
-                    **context,
-                    "needs_human": needs_human,
-                    "escalation_reason": escalation_reason,
-                    "tools_used": tools_used,
-                }
+                result = _parse_final_response(
+                    response,
+                    data,
+                    needs_human_from_tool=needs_human_from_tool,
+                    escalation_reason_from_tool=escalation_reason_from_tool,
+                )
+                result["tools_used"] = tools_used
+                return result
 
-            # Mantener la salida del modelo completa (incluidos tool calls/reasoning)
-            # antes de devolverle los resultados de las funciones.
-            input_items.extend(response.output)
             tool_outputs = []
-
             for call in function_calls:
                 try:
                     args = json.loads(call.arguments or "{}")
@@ -572,55 +538,64 @@ MENSAJE ACTUAL DEL CLIENTE:
 
                 tools_used.append(call.name)
 
-                if call.name == "guardar_contexto":
-                    _merge_context(context, args)
-                    result = {"status": "ok", "saved_context": context}
-
-                elif call.name == "consultar_pedido":
-                    result = consultar_pedido(
-                        school=args.get("school") or context.get("school"),
-                        order_number=args.get("order_number") or context.get("order_number"),
+                if call.name == "consultar_pedido":
+                    tool_result = consultar_pedido(
+                        school=args.get("school"),
+                        order_number=args.get("order_number"),
                     )
-                    if result.get("status") in {"school_mismatch"}:
-                        needs_human = True
-                        escalation_reason = result.get("status")
 
                 elif call.name == "buscar_info_escuela":
-                    result = buscar_info_escuela(
-                        school=args.get("school") or context.get("school"),
-                        query=args.get("query") or data.message,
+                    tool_result = buscar_info_escuela(
+                        school=args.get("school"),
+                        query=args.get("query"),
                     )
 
                 elif call.name == "escalar_asesor":
-                    needs_human = True
-                    escalation_reason = args.get("reason") or "requested_by_ai"
-                    result = {"status": "ok", "needs_human": True}
+                    tool_result = escalar_asesor(args.get("reason"))
+                    needs_human_from_tool = True
+                    escalation_reason_from_tool = tool_result.get("reason")
 
                 else:
-                    result = {"status": "error", "message": "Herramienta desconocida"}
+                    tool_result = {
+                        "status": "error",
+                        "message": "Herramienta no disponible.",
+                    }
 
                 tool_outputs.append({
                     "type": "function_call_output",
                     "call_id": call.call_id,
-                    "output": json.dumps(result, ensure_ascii=False),
+                    "output": json.dumps(tool_result, ensure_ascii=False),
                 })
 
-            input_items.extend(tool_outputs)
+            # Continuar exactamente el hilo generado por el modelo, incluyendo sus
+            # tool calls. El modelo recibe datos; él decide cómo interpretarlos y responder.
+            response = client.responses.create(
+                model=OPENAI_MODEL,
+                instructions=INSTRUCTIONS,
+                previous_response_id=response.id,
+                input=tool_outputs,
+                tools=TOOLS,
+                tool_choice="auto",
+                text={"format": FINAL_RESPONSE_FORMAT},
+                max_output_tokens=700,
+            )
 
         return {
-            "reply": "Necesito que un asesor de SportHouse continúe contigo para ayudarte correctamente.",
-            **context,
+            "reply": "Necesito que un asesor de SportHouse continúe contigo para revisar este caso.",
+            **_fallback_context(data),
             "needs_human": True,
             "escalation_reason": "tool_loop_limit",
+            "response_id": response.id,
             "tools_used": tools_used,
         }
 
-    except Exception as exc:
+    except Exception:
         logger.exception("Error en POST /chat")
         return {
             "reply": "Tuve un problema al revisar la información. Un asesor de SportHouse puede ayudarte.",
-            **context,
+            **_fallback_context(data),
             "needs_human": True,
             "escalation_reason": "backend_error",
+            "response_id": data.previous_response_id,
             "tools_used": tools_used,
         }
