@@ -953,9 +953,10 @@ def buscar_info_escuela(school: str, query: str):
     results = client.vector_stores.search(
         vector_store_id=vector_store_id,
         query=query,
-        attribute_filter=_knowledge_filter(resolved_school),
+        filters=_knowledge_filter(resolved_school),
         rewrite_query=True,
         max_num_results=10,
+        ranking_options={"score_threshold": KNOWLEDGE_SCORE_THRESHOLD},
     )
 
     matches = []
@@ -1417,6 +1418,7 @@ Puedes y debes combinar Knowledge con herramientas operativas cuando sea necesar
 El resultado de una herramienta NO significa automáticamente que la consulta completa esté resuelta. Antes de
 responder, verifica si aún falta información relevante. Antes de escalar por falta de información, si la escuela
 está clara y existe una posibilidad razonable de que la respuesta viva en Knowledge, consulta Knowledge primero.
+Si una herramienta devuelve `tool_error`, NO concluyas que la información no existe y NO escales automáticamente: utiliza el conocimiento ya recuperado en el contexto; si falta un dato esencial, pide una aclaración breve.
 Responde únicamente con información respaldada por las herramientas/contexto recuperado.
 
 PRODUCTOS, TALLAS Y COMPRA
@@ -1513,6 +1515,35 @@ def _parse_final_response(response, data: ChatRequest, needs_human_from_tool=Fal
 
     parsed["response_id"] = response.id
     return parsed
+
+
+@router.get("/knowledge/search")
+async def knowledge_search_debug(
+    school: str,
+    query: str,
+    x_knowledge_sync_key: Optional[str] = Header(default=None, alias="X-Knowledge-Sync-Key"),
+):
+    """Diagnóstico genérico del RAG. No lo usa ManyChat; sirve para verificar qué Knowledge recupera una consulta."""
+    if not KNOWLEDGE_SYNC_KEY or x_knowledge_sync_key != KNOWLEDGE_SYNC_KEY:
+        return {"status": "unauthorized", "message": "Sync key inválida."}
+    try:
+        result = buscar_info_escuela(school=school, query=query)
+        # Limitar texto para que Swagger sea legible, conservando título/score/fuente.
+        if result.get("status") == "ok":
+            compact = dict(result)
+            compact["matches"] = [
+                {**item, "text": (item.get("text") or "")[:1800]}
+                for item in (result.get("matches") or [])[:10]
+            ]
+            return compact
+        return result
+    except Exception as exc:
+        logger.exception("Error en GET /knowledge/search")
+        return {
+            "status": "error",
+            "error_type": type(exc).__name__,
+            "message": str(exc),
+        }
 
 
 @router.get("/knowledge/status")
@@ -1688,39 +1719,48 @@ async def chat(data: ChatRequest):
 
                 tools_used.append(call.name)
 
-                if call.name == "consultar_pedido":
-                    tool_result = consultar_pedido(
-                        school=args.get("school"),
-                        order_number=args.get("order_number"),
-                    )
+                try:
+                    if call.name == "consultar_pedido":
+                        tool_result = consultar_pedido(
+                            school=args.get("school"),
+                            order_number=args.get("order_number"),
+                        )
 
-                elif call.name == "buscar_info_escuela":
-                    tool_result = buscar_info_escuela(
-                        school=args.get("school"),
-                        query=args.get("query"),
-                    )
-                    if tool_result.get("status") == "ok":
-                        knowledge_sources.extend([
-                            item.get("article_name")
-                            for item in tool_result.get("matches") or []
-                            if item.get("article_name")
-                        ])
+                    elif call.name == "buscar_info_escuela":
+                        tool_result = buscar_info_escuela(
+                            school=args.get("school"),
+                            query=args.get("query"),
+                        )
+                        if tool_result.get("status") == "ok":
+                            knowledge_sources.extend([
+                                item.get("article_name")
+                                for item in tool_result.get("matches") or []
+                                if item.get("article_name")
+                            ])
 
-                elif call.name == "buscar_producto_escuela":
-                    tool_result = buscar_producto_escuela(
-                        school=args.get("school"),
-                        query=args.get("query"),
-                    )
+                    elif call.name == "buscar_producto_escuela":
+                        tool_result = buscar_producto_escuela(
+                            school=args.get("school"),
+                            query=args.get("query"),
+                        )
 
-                elif call.name == "escalar_asesor":
-                    tool_result = escalar_asesor(args.get("reason"))
-                    needs_human_from_tool = True
-                    escalation_reason_from_tool = tool_result.get("reason")
+                    elif call.name == "escalar_asesor":
+                        tool_result = escalar_asesor(args.get("reason"))
+                        needs_human_from_tool = True
+                        escalation_reason_from_tool = tool_result.get("reason")
 
-                else:
+                    else:
+                        tool_result = {
+                            "status": "error",
+                            "message": "Herramienta no disponible.",
+                        }
+                except Exception as tool_exc:
+                    logger.exception("Error ejecutando herramienta %s", call.name)
                     tool_result = {
-                        "status": "error",
-                        "message": "Herramienta no disponible.",
+                        "status": "tool_error",
+                        "tool": call.name,
+                        "message": "La herramienta tuvo un error técnico. No afirmes que la información no existe. Continúa con el contexto disponible y, si aún falta un dato esencial, pide una aclaración breve en lugar de inventar.",
+                        "debug_type": type(tool_exc).__name__,
                     }
 
                 tool_outputs.append({
