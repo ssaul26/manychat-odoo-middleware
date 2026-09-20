@@ -1,4 +1,4 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Header
 from pydantic import BaseModel
 from typing import Optional
 import html
@@ -7,9 +7,8 @@ import logging
 import os
 import re
 import unicodedata
-import hashlib
-import math
 import time
+import tempfile
 import xmlrpc.client
 from urllib.parse import urljoin
 
@@ -24,7 +23,10 @@ ODOO_USER = os.getenv("ODOO_USER")
 ODOO_PASSWORD = os.getenv("ODOO_PASSWORD")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6-luna")
-OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+OPENAI_KNOWLEDGE_VECTOR_STORE_ID = os.getenv("OPENAI_KNOWLEDGE_VECTOR_STORE_ID")
+OPENAI_KNOWLEDGE_VECTOR_STORE_NAME = os.getenv("OPENAI_KNOWLEDGE_VECTOR_STORE_NAME", "SportHouse Knowledge")
+KNOWLEDGE_SYNC_KEY = os.getenv("KNOWLEDGE_SYNC_KEY")
+KNOWLEDGE_SCORE_THRESHOLD = float(os.getenv("KNOWLEDGE_SCORE_THRESHOLD", "0.12"))
 
 
 class ChatRequest(BaseModel):
@@ -500,290 +502,354 @@ def consultar_pedido(school: str, order_number: str):
 
 
 _KNOWLEDGE_ARTICLE_CACHE = {"ts": 0.0, "items": []}
-_KNOWLEDGE_ARTICLE_CACHE_TTL = 300
-_EMBEDDING_CACHE = {}
-_EMBEDDING_CACHE_MAX = 4000
+_KNOWLEDGE_ARTICLE_CACHE_TTL = 120
+_VECTOR_STORE_CACHE = {"ts": 0.0, "id": None}
+_VECTOR_STORE_CACHE_TTL = 300
 
 
-def _load_knowledge_articles(uid, models):
-    """Carga artículos de Knowledge una vez por TTL para que la búsqueda sea global y consistente."""
+def _load_knowledge_articles(uid, models, force: bool = False):
+    """Lee Knowledge de Odoo. Odoo sigue siendo la fuente maestra."""
     now = time.time()
     if (
-        _KNOWLEDGE_ARTICLE_CACHE["items"]
+        not force
+        and _KNOWLEDGE_ARTICLE_CACHE["items"]
         and now - _KNOWLEDGE_ARTICLE_CACHE["ts"] < _KNOWLEDGE_ARTICLE_CACHE_TTL
     ):
         return _KNOWLEDGE_ARTICLE_CACHE["items"]
+
+    fields_meta = _available_fields(uid, models, "knowledge.article")
+    read_fields = ["id", "name", "body"]
+    if "write_date" in fields_meta:
+        read_fields.append("write_date")
 
     rows = models.execute_kw(
         ODOO_DB, uid, ODOO_PASSWORD,
         "knowledge.article", "search_read",
         [[]],
         {
-            "fields": ["id", "name", "body"],
+            "fields": read_fields,
             "order": "name asc",
-            "limit": 1500,
+            "limit": 3000,
         },
     ) or []
 
     cleaned = []
     for row in rows:
+        text = _clean_html(row.get("body") or "")
+        name = (row.get("name") or "").strip()
+        if not name and not text:
+            continue
         cleaned.append({
             "id": row.get("id"),
-            "name": (row.get("name") or "").strip(),
-            "text": _clean_html(row.get("body") or ""),
+            "name": name or f"Artículo {row.get('id')}",
+            "text": text,
+            "write_date": row.get("write_date") or "",
         })
 
     _KNOWLEDGE_ARTICLE_CACHE.update({"ts": now, "items": cleaned})
     return cleaned
 
 
-def _knowledge_scope_aliases(resolved_school: dict):
-    """
-    Devuelve los nombres que definen el universo permitido de conocimiento.
-    Ejemplo IMS -> Instituto México Secundaria + Maristas.
-    """
-    aliases = []
-    for value in (
-        resolved_school.get("canonical_school"),
-        resolved_school.get("parent_website"),
-    ):
-        value = (value or "").strip()
-        if not value:
-            continue
-        if not any(_norm(value) == _norm(existing) for existing in aliases):
-            aliases.append(value)
-    return aliases
+def _norm_key(value: Optional[str]) -> str:
+    value = _norm(value)
+    value = re.sub(r"[^a-z0-9]+", "_", value).strip("_")
+    return value[:240]
 
 
-def _article_scope_score(article: dict, aliases: list[str]) -> float:
-    """
-    Decide si un artículo pertenece a la escuela/grupo sin depender de un catálogo de temas.
-    Se apoya en el título y, como fallback, en menciones explícitas dentro del contenido.
-    """
-    title = article.get("name") or ""
-    body = article.get("text") or ""
-    title_norm = _norm(title)
-    body_norm = _norm(body[:6000])
-    best = 0.0
-
-    for alias in aliases:
-        if not alias:
-            continue
-        alias_norm = _norm(alias)
-        score = _school_match_score(alias, title)
-        if alias_norm and alias_norm in title_norm:
-            score = max(score, 95.0)
-        elif alias_norm and alias_norm in body_norm:
-            score = max(score, 62.0)
-        best = max(best, score)
-
-    return best
+def _knowledge_groups(registry: list[dict]) -> list[str]:
+    groups = []
+    for item in registry:
+        value = (item.get("parent_website") or "").strip()
+        if value and not any(_norm(value) == _norm(x) for x in groups):
+            groups.append(value)
+    return groups
 
 
-def _chunk_text(text: str, max_chars: int = 1400, overlap: int = 180):
-    """Divide artículos largos para recuperar el fragmento relevante, no el documento completo."""
-    text = (text or "").strip()
-    if not text:
-        return []
-    if len(text) <= max_chars:
-        return [text]
-
-    chunks = []
-    start = 0
-    while start < len(text):
-        end = min(len(text), start + max_chars)
-        chunk = text[start:end]
-
-        # Intentar cortar cerca de un salto o final de frase para conservar legibilidad.
-        if end < len(text):
-            cut_candidates = [
-                chunk.rfind("\n\n"),
-                chunk.rfind("\n"),
-                chunk.rfind(". "),
-            ]
-            cut = max(cut_candidates)
-            if cut >= int(max_chars * 0.55):
-                end = start + cut + (2 if chunk[cut:cut+2] == ". " else 0)
-                chunk = text[start:end]
-
-        chunk = chunk.strip()
-        if chunk:
-            chunks.append(chunk)
-        if end >= len(text):
-            break
-        start = max(start + 1, end - overlap)
-
-    return chunks
-
-
-def _normalize_vector(vector):
-    norm = math.sqrt(sum(float(x) * float(x) for x in vector)) or 1.0
-    return [float(x) / norm for x in vector]
-
-
-def _embedding_cache_key(text: str) -> str:
-    payload = f"{OPENAI_EMBEDDING_MODEL}\n{text}".encode("utf-8", errors="ignore")
-    return hashlib.sha1(payload).hexdigest()
-
-
-def _embed_texts(texts: list[str]):
-    """
-    Embeddings con caché en memoria. Si OpenAI no está disponible, el caller usa ranking léxico.
-    """
-    if not texts or not OPENAI_API_KEY:
-        return [None] * len(texts)
-
-    result = [None] * len(texts)
-    missing_indexes = []
-    missing_texts = []
-
-    for idx, text in enumerate(texts):
-        key = _embedding_cache_key(text)
-        cached = _EMBEDDING_CACHE.get(key)
-        if cached is not None:
-            result[idx] = cached
-        else:
-            missing_indexes.append(idx)
-            missing_texts.append(text)
-
-    if missing_texts:
-        client = OpenAI(api_key=OPENAI_API_KEY)
-        # Batch corto para evitar requests gigantes si alguna escuela tiene mucho contenido.
-        cursor = 0
-        while cursor < len(missing_texts):
-            batch_texts = missing_texts[cursor:cursor + 64]
-            response = client.embeddings.create(
-                model=OPENAI_EMBEDDING_MODEL,
-                input=batch_texts,
-            )
-            for offset, item in enumerate(response.data):
-                global_missing_pos = cursor + offset
-                original_idx = missing_indexes[global_missing_pos]
-                vector = _normalize_vector(item.embedding)
-                result[original_idx] = vector
-                _EMBEDDING_CACHE[_embedding_cache_key(texts[original_idx])] = vector
-            cursor += len(batch_texts)
-
-        # Límite sencillo de memoria; si crece demasiado, empezamos caché fresca.
-        if len(_EMBEDDING_CACHE) > _EMBEDDING_CACHE_MAX:
-            _EMBEDDING_CACHE.clear()
-
-    return result
-
-
-def _lexical_relevance(query: str, title: str, text: str) -> float:
-    q_tokens = {
-        token for token in re.findall(r"[a-z0-9]+", _norm(query))
-        if len(token) >= 3
-    }
-    if not q_tokens:
+def _scope_score(alias: str, article_name: str, article_text: str) -> float:
+    """Puntaje genérico: prioriza el título y usa el cuerpo solo como fallback."""
+    if not alias:
         return 0.0
-    title_norm = _norm(title)
-    text_norm = _norm(text)
-    score = 0.0
-    for token in q_tokens:
-        if token in title_norm:
-            score += 3.0
-        if token in text_norm:
-            score += 0.7
+    score = _school_match_score(alias, article_name)
+    alias_norm = _norm(alias)
+    title_norm = _norm(article_name)
+    body_norm = _norm((article_text or "")[:2500])
+    if alias_norm and alias_norm in title_norm:
+        score = max(score, 98.0)
+    elif alias_norm and alias_norm in body_norm:
+        score = max(score, 55.0)
     return score
 
 
-def _semantic_knowledge_search(uid, models, resolved_school: dict, query: str, limit: int = 6):
+def _infer_article_scope(article: dict, registry: list[dict]) -> dict:
     """
-    Búsqueda semántica universal dentro del universo permitido de la escuela/grupo.
-    No clasifica por temas: compara el significado de la pregunta contra fragmentos de todos
-    los artículos relevantes de Odoo.
+    Infere el alcance de un artículo sin hardcodear escuelas ni temas.
+    - Si el título apunta a una escuela concreta -> scope_type=school.
+    - Si apunta a un website que agrupa escuelas -> scope_type=group.
+    - Si no hay alcance claro -> global.
     """
-    aliases = _knowledge_scope_aliases(resolved_school)
-    all_articles = _load_knowledge_articles(uid, models)
+    groups = _knowledge_groups(registry)
+    group_norms = {_norm(g) for g in groups}
 
-    scoped = []
-    for article in all_articles:
-        scope_score = _article_scope_score(article, aliases)
-        if scope_score >= 55:
-            scoped.append((scope_score, article))
+    best_school = (0.0, None)
+    best_group = (0.0, None)
 
-    if not scoped:
-        return []
+    for group in groups:
+        score = _scope_score(group, article.get("name") or "", article.get("text") or "")
+        if score > best_group[0]:
+            best_group = (score, group)
 
-    chunk_rows = []
-    for scope_score, article in scoped:
-        chunks = _chunk_text(article.get("text") or "") or [""]
-        for idx, chunk in enumerate(chunks):
-            embedding_text = f"{article.get('name') or ''}\n{chunk}".strip()
-            if not embedding_text:
-                continue
-            chunk_rows.append({
+    for item in registry:
+        name = (item.get("canonical_school") or "").strip()
+        if not name:
+            continue
+        # Un website que es padre de otras escuelas se trata como grupo, no como escuela concreta.
+        if item.get("source") == "website" and _norm(name) in group_norms:
+            continue
+        score = _scope_score(name, article.get("name") or "", article.get("text") or "")
+        if score > best_school[0]:
+            best_school = (score, name)
+
+    school_score, school_name = best_school
+    group_score, group_name = best_group
+
+    if school_name and school_score >= 68 and school_score >= group_score + 4:
+        return {
+            "scope_type": "school",
+            "scope_name": school_name,
+            "scope_key": _norm_key(school_name),
+            "score": round(school_score, 1),
+        }
+
+    if group_name and group_score >= 65:
+        return {
+            "scope_type": "group",
+            "scope_name": group_name,
+            "scope_key": _norm_key(group_name),
+            "score": round(group_score, 1),
+        }
+
+    if school_name and school_score >= 60:
+        return {
+            "scope_type": "school",
+            "scope_name": school_name,
+            "scope_key": _norm_key(school_name),
+            "score": round(school_score, 1),
+        }
+
+    return {
+        "scope_type": "global",
+        "scope_name": "SportHouse",
+        "scope_key": "global",
+        "score": 0.0,
+    }
+
+
+def _get_vector_store_id(client: OpenAI, create_if_missing: bool = True) -> Optional[str]:
+    """Usa ID fijo si existe; si no, localiza/crea el store por nombre."""
+    if OPENAI_KNOWLEDGE_VECTOR_STORE_ID:
+        return OPENAI_KNOWLEDGE_VECTOR_STORE_ID
+
+    now = time.time()
+    if _VECTOR_STORE_CACHE.get("id") and now - _VECTOR_STORE_CACHE.get("ts", 0) < _VECTOR_STORE_CACHE_TTL:
+        return _VECTOR_STORE_CACHE["id"]
+
+    try:
+        page = client.vector_stores.list(limit=100)
+        for store in getattr(page, "data", []) or []:
+            if (getattr(store, "name", "") or "").strip() == OPENAI_KNOWLEDGE_VECTOR_STORE_NAME:
+                _VECTOR_STORE_CACHE.update({"ts": now, "id": store.id})
+                return store.id
+    except Exception:
+        logger.warning("No se pudo listar vector stores", exc_info=True)
+
+    if not create_if_missing:
+        return None
+
+    store = client.vector_stores.create(name=OPENAI_KNOWLEDGE_VECTOR_STORE_NAME)
+    _VECTOR_STORE_CACHE.update({"ts": now, "id": store.id})
+    return store.id
+
+
+def _list_vector_store_files(client: OpenAI, vector_store_id: str):
+    items = []
+    after = None
+    while True:
+        kwargs = {"vector_store_id": vector_store_id, "limit": 100}
+        if after:
+            kwargs["after"] = after
+        page = client.vector_stores.files.list(**kwargs)
+        data = list(getattr(page, "data", []) or [])
+        items.extend(data)
+        if not getattr(page, "has_more", False) or not data:
+            break
+        after = getattr(data[-1], "id", None)
+        if not after:
+            break
+    return items
+
+
+def _clear_vector_store(client: OpenAI, vector_store_id: str):
+    deleted = 0
+    for item in _list_vector_store_files(client, vector_store_id):
+        file_id = getattr(item, "id", None)
+        if not file_id:
+            continue
+        try:
+            client.vector_stores.files.delete(
+                vector_store_id=vector_store_id,
+                file_id=file_id,
+            )
+            deleted += 1
+        except Exception:
+            logger.warning("No se pudo desvincular archivo %s", file_id, exc_info=True)
+        # Eliminar también el archivo subyacente para no acumular almacenamiento.
+        try:
+            client.files.delete(file_id)
+        except Exception:
+            pass
+    return deleted
+
+
+def _article_file_content(article: dict, scope: dict) -> str:
+    return (
+        f"TÍTULO: {article.get('name') or ''}\n"
+        f"ALCANCE: {scope.get('scope_type')} - {scope.get('scope_name')}\n"
+        f"ARTÍCULO ODOO ID: {article.get('id')}\n"
+        f"ÚLTIMA ACTUALIZACIÓN ODOO: {article.get('write_date') or 'N/D'}\n\n"
+        f"CONTENIDO:\n{article.get('text') or ''}\n"
+    )
+
+
+def _upload_article(client: OpenAI, vector_store_id: str, article: dict, scope: dict):
+    safe_title = re.sub(r"[^A-Za-z0-9._-]+", "_", article.get("name") or "article")[:90]
+    filename = f"odoo_{article.get('id')}_{safe_title}.txt"
+    content = _article_file_content(article, scope)
+
+    path = None
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as tmp:
+            tmp.write(content)
+            path = tmp.name
+
+        with open(path, "rb") as fh:
+            vector_file = client.vector_stores.files.upload_and_poll(
+                vector_store_id=vector_store_id,
+                file=fh,
+            )
+
+        file_id = getattr(vector_file, "id", None)
+        if not file_id:
+            raise RuntimeError("OpenAI no devolvió file_id al indexar artículo")
+
+        attrs = {
+            "scope_type": scope.get("scope_type") or "global",
+            "scope_key": scope.get("scope_key") or "global",
+            "scope_name": (scope.get("scope_name") or "SportHouse")[:256],
+            "article_id": int(article.get("id") or 0),
+            "article_name": (article.get("name") or "")[:256],
+            "write_date": (article.get("write_date") or "")[:256],
+            "source": "odoo_knowledge",
+        }
+        client.vector_stores.files.update(
+            vector_store_id=vector_store_id,
+            file_id=file_id,
+            attributes=attrs,
+        )
+        return file_id
+    finally:
+        if path:
+            try:
+                os.unlink(path)
+            except Exception:
+                pass
+
+
+def sync_knowledge_vector_store():
+    """Reconstruye el índice semántico desde Knowledge de Odoo."""
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY no configurada")
+
+    uid, models = _odoo()
+    registry = _school_registry(uid, models)
+    articles = _load_knowledge_articles(uid, models, force=True)
+    client = OpenAI(api_key=OPENAI_API_KEY)
+    vector_store_id = _get_vector_store_id(client, create_if_missing=True)
+
+    removed = _clear_vector_store(client, vector_store_id)
+    indexed = []
+    skipped = []
+
+    for article in articles:
+        if not (article.get("text") or "").strip():
+            skipped.append({"id": article.get("id"), "name": article.get("name"), "reason": "empty"})
+            continue
+        scope = _infer_article_scope(article, registry)
+        try:
+            file_id = _upload_article(client, vector_store_id, article, scope)
+            indexed.append({
                 "article_id": article.get("id"),
                 "article_name": article.get("name"),
-                "chunk_index": idx,
-                "text": chunk,
-                "embedding_text": embedding_text[:6000],
-                "scope_score": scope_score,
+                "scope_type": scope.get("scope_type"),
+                "scope_name": scope.get("scope_name"),
+                "file_id": file_id,
+            })
+        except Exception as exc:
+            logger.exception("No se pudo indexar Knowledge article %s", article.get("id"))
+            skipped.append({
+                "id": article.get("id"),
+                "name": article.get("name"),
+                "reason": str(exc)[:300],
             })
 
-    if not chunk_rows:
-        return []
+    return {
+        "status": "ok",
+        "vector_store_id": vector_store_id,
+        "vector_store_name": OPENAI_KNOWLEDGE_VECTOR_STORE_NAME,
+        "removed_previous_files": removed,
+        "odoo_articles_found": len(articles),
+        "indexed_count": len(indexed),
+        "skipped_count": len(skipped),
+        "indexed": indexed,
+        "skipped": skipped,
+    }
 
-    semantic_available = False
-    query_vector = None
-    chunk_vectors = [None] * len(chunk_rows)
-    try:
-        vectors = _embed_texts([query] + [row["embedding_text"] for row in chunk_rows])
-        query_vector = vectors[0]
-        chunk_vectors = vectors[1:]
-        semantic_available = query_vector is not None and any(v is not None for v in chunk_vectors)
-    except Exception:
-        logger.warning("Fallo ranking semántico; usando fallback léxico", exc_info=True)
 
-    ranked = []
-    for idx, row in enumerate(chunk_rows):
-        lexical = _lexical_relevance(query, row["article_name"], row["text"])
-        semantic = 0.0
-        if semantic_available and chunk_vectors[idx] is not None:
-            semantic = sum(a * b for a, b in zip(query_vector, chunk_vectors[idx]))
-        # Scope solo rompe empates; el significado de la pregunta debe dominar.
-        final_score = (semantic * 100.0 if semantic_available else 0.0) + lexical + (row["scope_score"] / 100.0)
-        ranked.append((final_score, semantic, lexical, row))
+def _knowledge_filter(resolved_school: dict):
+    filters = [{"type": "eq", "key": "scope_type", "value": "global"}]
+    school = (resolved_school.get("canonical_school") or "").strip()
+    group = (resolved_school.get("parent_website") or "").strip()
+    if school:
+        filters.append({"type": "eq", "key": "scope_key", "value": _norm_key(school)})
+    if group and _norm(group) != _norm(school):
+        filters.append({"type": "eq", "key": "scope_key", "value": _norm_key(group)})
+    return {"type": "or", "filters": filters}
 
-    ranked.sort(key=lambda x: (-x[0], _norm(x[3].get("article_name") or ""), x[3]["chunk_index"]))
 
-    selected = []
-    per_article = {}
-    for final_score, semantic, lexical, row in ranked:
-        article_id = row.get("article_id")
-        # Máximo dos fragmentos del mismo artículo para dar diversidad de fuentes.
-        if per_article.get(article_id, 0) >= 2:
-            continue
-        per_article[article_id] = per_article.get(article_id, 0) + 1
-        selected.append({
-            "article_id": article_id,
-            "article_name": row.get("article_name"),
-            "text": row.get("text"),
-            "semantic_score": round(float(semantic), 4) if semantic_available else None,
-        })
-        if len(selected) >= limit:
-            break
-
-    return selected
+def _result_text(result) -> str:
+    chunks = []
+    for item in getattr(result, "content", []) or []:
+        text = getattr(item, "text", None)
+        if text:
+            chunks.append(text)
+    return "\n".join(chunks).strip()
 
 
 def buscar_info_escuela(school: str, query: str):
     """
-    Recupera semánticamente conocimiento de Odoo para la escuela concreta y su grupo.
-
-    Esta herramienta es universal: sirve para cualquier información factual o de políticas
-    que viva en Knowledge, sin requerir una ruta/intent específica por tema.
+    RAG persistente: busca por significado en el índice vectorial sincronizado desde Odoo.
+    Filtra antes de buscar para no mezclar escuelas/grupos.
     """
     school = (school or "").strip()
     query = (query or "").strip()
-
     if not school:
         return {
             "status": "missing_school",
             "message": "Falta la escuela. Pregunta al cliente antes de buscar información específica.",
         }
+    if not query:
+        return {"status": "missing_query", "message": "Falta la consulta de conocimiento."}
+    if not OPENAI_API_KEY:
+        return {"status": "error", "message": "OpenAI no está configurado."}
 
     uid, models = _odoo()
     resolved_school = _resolve_school(uid, models, school)
@@ -795,29 +861,60 @@ def buscar_info_escuela(school: str, query: str):
             "message": "No pude identificar de forma segura la escuela. Pide una aclaración.",
         }
 
-    canonical_school = resolved_school.get("canonical_school") or school
-    knowledge_group = (resolved_school.get("parent_website") or "").strip() or None
-    matches = _semantic_knowledge_search(uid, models, resolved_school, query, limit=6)
+    client = OpenAI(api_key=OPENAI_API_KEY)
+    vector_store_id = _get_vector_store_id(client, create_if_missing=False)
+    if not vector_store_id:
+        return {
+            "status": "knowledge_not_synced",
+            "school": resolved_school.get("canonical_school") or school,
+            "message": "La base semántica de Knowledge todavía no está sincronizada.",
+        }
+
+    results = client.vector_stores.search(
+        vector_store_id=vector_store_id,
+        query=query,
+        attribute_filter=_knowledge_filter(resolved_school),
+        rewrite_query=True,
+        max_num_results=10,
+    )
+
+    matches = []
+    for result in getattr(results, "data", []) or []:
+        score = float(getattr(result, "score", 0.0) or 0.0)
+        if score < KNOWLEDGE_SCORE_THRESHOLD:
+            continue
+        attrs = getattr(result, "attributes", None) or {}
+        text = _result_text(result)
+        if not text:
+            continue
+        matches.append({
+            "article_id": attrs.get("article_id"),
+            "article_name": attrs.get("article_name") or getattr(result, "filename", None),
+            "scope_type": attrs.get("scope_type"),
+            "scope_name": attrs.get("scope_name"),
+            "score": round(score, 4),
+            "text": text,
+        })
 
     if not matches:
         return {
             "status": "not_found",
-            "school": canonical_school,
-            "knowledge_group": knowledge_group,
+            "school": resolved_school.get("canonical_school") or school,
+            "knowledge_group": resolved_school.get("parent_website") or None,
             "query": query,
-            "message": "No encontré información relevante en Knowledge para esa escuela o su grupo.",
+            "message": "El índice no encontró fragmentos suficientemente relevantes para esta pregunta.",
         }
 
     return {
         "status": "ok",
-        "school": canonical_school,
-        "knowledge_group": knowledge_group,
+        "school": resolved_school.get("canonical_school") or school,
+        "knowledge_group": resolved_school.get("parent_website") or None,
         "query": query,
+        "search_query": getattr(results, "search_query", query),
         "matches": matches,
         "instruction": (
-            "Responde únicamente con información respaldada por estos fragmentos. "
-            "Puedes combinar varios si son complementarios. Si los fragmentos no responden "
-            "por completo, usa otras herramientas necesarias antes de concluir o escalar."
+            "Usa estos fragmentos como fuente factual. Combínalos con herramientas operativas si la pregunta "
+            "también depende de un pedido o producto. No inventes lo que los fragmentos no dicen."
         ),
     }
 
@@ -1062,7 +1159,7 @@ TOOLS = [
         "type": "function",
         "name": "buscar_info_escuela",
         "description": (
-            "Busca semánticamente en toda la base Knowledge de Odoo permitida para la escuela y su grupo. "
+            "Busca mediante RAG persistente en el índice semántico sincronizado desde Knowledge de Odoo para la escuela y su grupo. "
             "Úsala para cualquier información factual, política, instrucción, tiempo, lugar, link, pago, compra, "
             "cambio, entrega, recolección, guía o explicación que pueda vivir en Knowledge. No depende de palabras "
             "exactas ni de una categoría fija. Puede combinarse con consultar_pedido o buscar_producto_escuela en el mismo turno."
@@ -1230,7 +1327,7 @@ para la escuela concreta y, cuando corresponda, su grupo.
 
 Si el conocimiento precargado no basta y la pregunta puede depender de información de SportHouse, llama
 buscar_info_escuela con una consulta descriptiva de lo que necesitas saber. No esperes palabras exactas ni
-clasifiques la pregunta en un catálogo rígido. La búsqueda es semántica.
+clasifiques la pregunta en un catálogo rígido. La búsqueda usa un índice vectorial persistente, filtrado por escuela/grupo y con reescritura automática de consultas.
 
 Puedes y debes combinar Knowledge con herramientas operativas cuando sea necesario. Ejemplos conceptuales:
 - un estatus de pedido puede requerir consultar_pedido + Knowledge para explicar qué sigue, dónde se entrega o tiempos;
@@ -1273,7 +1370,8 @@ ESCALAMIENTO
 No digas "ya te pasé con un asesor" a menos que realmente hayas llamado escalar_asesor. Si lo llamas,
 puedes decir que un asesor continuará o revisará el caso. No escales solo porque el cliente escribió raro:
 primero conversa y aclara cuando sea razonable. Tampoco escales por falta de información factual sin haber
-revisado el conocimiento precargado y, cuando corresponda, haber llamado buscar_info_escuela.
+revisado el conocimiento RAG precargado y, cuando corresponda, haber llamado buscar_info_escuela. Si Knowledge devuelve
+fragmentos relevantes, aprovéchalos antes de escalar; un estado de pedido por sí solo no responde preguntas sobre qué sigue.
 
 ESTILO
 - Español por defecto.
@@ -1335,6 +1433,50 @@ def _parse_final_response(response, data: ChatRequest, needs_human_from_tool=Fal
 
     parsed["response_id"] = response.id
     return parsed
+
+
+@router.get("/knowledge/status")
+async def knowledge_status():
+    if not OPENAI_API_KEY:
+        return {"status": "error", "message": "OPENAI_API_KEY no configurada"}
+    client = OpenAI(api_key=OPENAI_API_KEY)
+    vector_store_id = _get_vector_store_id(client, create_if_missing=False)
+    if not vector_store_id:
+        return {
+            "status": "not_synced",
+            "vector_store_name": OPENAI_KNOWLEDGE_VECTOR_STORE_NAME,
+            "sync_key_configured": bool(KNOWLEDGE_SYNC_KEY),
+        }
+    try:
+        store = client.vector_stores.retrieve(vector_store_id=vector_store_id)
+        counts = getattr(store, "file_counts", None)
+        if hasattr(counts, "model_dump"):
+            counts = counts.model_dump()
+        return {
+            "status": "ok",
+            "vector_store_id": vector_store_id,
+            "vector_store_name": getattr(store, "name", OPENAI_KNOWLEDGE_VECTOR_STORE_NAME),
+            "file_counts": counts,
+            "sync_key_configured": bool(KNOWLEDGE_SYNC_KEY),
+        }
+    except Exception as exc:
+        return {"status": "error", "message": str(exc)}
+
+
+@router.post("/knowledge/sync")
+async def knowledge_sync(x_knowledge_sync_key: Optional[str] = Header(default=None, alias="X-Knowledge-Sync-Key")):
+    if not KNOWLEDGE_SYNC_KEY:
+        return {
+            "status": "error",
+            "message": "Configura KNOWLEDGE_SYNC_KEY en Railway antes de habilitar la sincronización.",
+        }
+    if x_knowledge_sync_key != KNOWLEDGE_SYNC_KEY:
+        return {"status": "unauthorized", "message": "Sync key inválida."}
+    try:
+        return sync_knowledge_vector_store()
+    except Exception as exc:
+        logger.exception("Error sincronizando Knowledge")
+        return {"status": "error", "message": str(exc)}
 
 
 @router.post("/chat")
