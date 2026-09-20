@@ -1,6 +1,7 @@
-from fastapi import APIRouter, Header
+from fastapi import APIRouter, Header, BackgroundTasks
 from pydantic import BaseModel
 from typing import Optional
+from datetime import datetime
 import html
 import json
 import logging
@@ -9,6 +10,7 @@ import re
 import unicodedata
 import time
 import tempfile
+import threading
 import xmlrpc.client
 from urllib.parse import urljoin
 
@@ -506,6 +508,16 @@ _KNOWLEDGE_ARTICLE_CACHE_TTL = 120
 _VECTOR_STORE_CACHE = {"ts": 0.0, "id": None}
 _VECTOR_STORE_CACHE_TTL = 300
 
+_KNOWLEDGE_SYNC_LOCK = threading.Lock()
+_KNOWLEDGE_SYNC_STATE = {
+    "status": "idle",
+    "started_at": None,
+    "finished_at": None,
+    "message": None,
+    "result": None,
+    "error": None,
+}
+
 
 def _load_knowledge_articles(uid, models, force: bool = False):
     """Lee Knowledge de Odoo. Odoo sigue siendo la fuente maestra."""
@@ -765,21 +777,32 @@ def _upload_article(client: OpenAI, vector_store_id: str, article: dict, scope: 
 
 
 def sync_knowledge_vector_store():
-    """Reconstruye el índice semántico desde Knowledge de Odoo."""
+    """
+    Reconstruye el índice semántico desde Knowledge de Odoo.
+
+    La sincronización es segura: primero sube los archivos nuevos y solo al final
+    elimina los archivos anteriores. Así, si una carga falla a la mitad, el índice
+    previo sigue disponible.
+    """
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY no configurada")
 
     uid, models = _odoo()
     registry = _school_registry(uid, models)
     articles = _load_knowledge_articles(uid, models, force=True)
-    client = OpenAI(api_key=OPENAI_API_KEY)
+    client = OpenAI(api_key=OPENAI_API_KEY, timeout=90.0)
     vector_store_id = _get_vector_store_id(client, create_if_missing=True)
 
-    removed = _clear_vector_store(client, vector_store_id)
+    # Conservamos el índice anterior mientras construimos el nuevo.
+    previous_files = [getattr(item, "id", None) for item in _list_vector_store_files(client, vector_store_id)]
+    previous_files = [file_id for file_id in previous_files if file_id]
+
     indexed = []
     skipped = []
 
-    for article in articles:
+    total = len(articles)
+    for pos, article in enumerate(articles, start=1):
+        _KNOWLEDGE_SYNC_STATE["message"] = f"Indexando artículo {pos} de {total}: {article.get('name') or article.get('id')}"
         if not (article.get("text") or "").strip():
             skipped.append({"id": article.get("id"), "name": article.get("name"), "reason": "empty"})
             continue
@@ -801,6 +824,28 @@ def sync_knowledge_vector_store():
                 "reason": str(exc)[:300],
             })
 
+    # Si no logramos indexar nada, no tocamos el índice anterior.
+    if not indexed and articles:
+        raise RuntimeError(
+            "No se pudo indexar ningún artículo. El índice anterior se conservó. "
+            f"Primeros errores: {skipped[:3]}"
+        )
+
+    removed = 0
+    for file_id in previous_files:
+        # Si por alguna razón OpenAI reutilizara un ID, no lo eliminamos.
+        if any(item.get("file_id") == file_id for item in indexed):
+            continue
+        try:
+            client.vector_stores.files.delete(vector_store_id=vector_store_id, file_id=file_id)
+            removed += 1
+        except Exception:
+            logger.warning("No se pudo desvincular archivo anterior %s", file_id, exc_info=True)
+        try:
+            client.files.delete(file_id)
+        except Exception:
+            pass
+
     return {
         "status": "ok",
         "vector_store_id": vector_store_id,
@@ -812,6 +857,41 @@ def sync_knowledge_vector_store():
         "indexed": indexed,
         "skipped": skipped,
     }
+
+
+def _run_knowledge_sync_job():
+    """Ejecuta la sincronización fuera de la petición HTTP para evitar timeouts del proxy."""
+    acquired = _KNOWLEDGE_SYNC_LOCK.acquire(blocking=False)
+    if not acquired:
+        return
+    try:
+        _KNOWLEDGE_SYNC_STATE.update({
+            "status": "running",
+            "started_at": datetime.utcnow().isoformat() + "Z",
+            "finished_at": None,
+            "message": "Iniciando sincronización de Knowledge...",
+            "result": None,
+            "error": None,
+        })
+        result = sync_knowledge_vector_store()
+        _KNOWLEDGE_SYNC_STATE.update({
+            "status": "completed",
+            "finished_at": datetime.utcnow().isoformat() + "Z",
+            "message": "Sincronización completada.",
+            "result": result,
+            "error": None,
+        })
+    except Exception as exc:
+        logger.exception("Error en sincronización de Knowledge en background")
+        _KNOWLEDGE_SYNC_STATE.update({
+            "status": "failed",
+            "finished_at": datetime.utcnow().isoformat() + "Z",
+            "message": "La sincronización falló.",
+            "result": None,
+            "error": str(exc),
+        })
+    finally:
+        _KNOWLEDGE_SYNC_LOCK.release()
 
 
 def _knowledge_filter(resolved_school: dict):
@@ -1464,7 +1544,10 @@ async def knowledge_status():
 
 
 @router.post("/knowledge/sync")
-async def knowledge_sync(x_knowledge_sync_key: Optional[str] = Header(default=None, alias="X-Knowledge-Sync-Key")):
+async def knowledge_sync(
+    background_tasks: BackgroundTasks,
+    x_knowledge_sync_key: Optional[str] = Header(default=None, alias="X-Knowledge-Sync-Key"),
+):
     if not KNOWLEDGE_SYNC_KEY:
         return {
             "status": "error",
@@ -1472,11 +1555,38 @@ async def knowledge_sync(x_knowledge_sync_key: Optional[str] = Header(default=No
         }
     if x_knowledge_sync_key != KNOWLEDGE_SYNC_KEY:
         return {"status": "unauthorized", "message": "Sync key inválida."}
-    try:
-        return sync_knowledge_vector_store()
-    except Exception as exc:
-        logger.exception("Error sincronizando Knowledge")
-        return {"status": "error", "message": str(exc)}
+
+    if _KNOWLEDGE_SYNC_STATE.get("status") == "running":
+        return {
+            "status": "already_running",
+            "message": _KNOWLEDGE_SYNC_STATE.get("message"),
+            "started_at": _KNOWLEDGE_SYNC_STATE.get("started_at"),
+        }
+
+    background_tasks.add_task(_run_knowledge_sync_job)
+    return {
+        "status": "started",
+        "message": "Sincronización iniciada en segundo plano. Consulta GET /knowledge/sync/status para ver el progreso.",
+    }
+
+
+@router.get("/knowledge/sync/status")
+async def knowledge_sync_status():
+    state = dict(_KNOWLEDGE_SYNC_STATE)
+    result = state.get("result")
+    # Evitamos devolver cientos de artículos en cada consulta de progreso.
+    if isinstance(result, dict):
+        state["result"] = {
+            "status": result.get("status"),
+            "vector_store_id": result.get("vector_store_id"),
+            "vector_store_name": result.get("vector_store_name"),
+            "removed_previous_files": result.get("removed_previous_files"),
+            "odoo_articles_found": result.get("odoo_articles_found"),
+            "indexed_count": result.get("indexed_count"),
+            "skipped_count": result.get("skipped_count"),
+            "skipped": result.get("skipped", [])[:20],
+        }
+    return state
 
 
 @router.post("/chat")
