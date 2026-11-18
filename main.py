@@ -575,19 +575,12 @@ async def send_whatsapp(request: Request):
         except:
             pass
 
-        # 2. Si no existe, buscarlo
+        # 2. Si ya existe, buscarlo por teléfono (GET con ?phone=, no POST)
+        find_json = None
         if not subscriber_id:
-            find_url = "https://api.manychat.com/fb/subscriber/findBySystemField"
-
-            find_payload = {
-                "field_name": "whatsapp_phone",
-                "field_value": phone
-            }
-
-            find_response = requests.post(find_url, json=find_payload, headers=headers)
-            find_json = find_response.json()
-
-            subscriber_id = find_json.get("data", {}).get("id")
+            found = find_manychat_contact(phone)
+            subscriber_id = found["subscriber_id"]
+            find_json = found
 
         # 🔥 VALIDACIÓN CLAVE
         if not subscriber_id:
@@ -722,26 +715,22 @@ def find_manychat_contact(phone):
     for formatted_phone in normalize_mexican_phone(phone):
         attempted_phones.append(formatted_phone)
 
-        response = requests.post(
+        response = requests.get(
             url,
-            json={
-                "field_name": "whatsapp_phone",
-                "field_value": formatted_phone
-            },
+            params={"phone": formatted_phone},
             headers=HEADERS,
             timeout=20
         )
 
         try:
-            response_data = response.json()
+            data = response.json().get("data")
         except Exception:
             continue
 
-        subscriber_id = (
-            response_data
-            .get("data", {})
-            .get("id")
-        )
+        # ManyChat puede devolver un objeto o una lista
+        if isinstance(data, list):
+            data = data[0] if data else None
+        subscriber_id = (data or {}).get("id")
 
         if subscriber_id:
             return {
@@ -1382,4 +1371,3 @@ async def tag_monteverde_por_pedido():
             "status": "error",
             "message": str(error)
         }
-
