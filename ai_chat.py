@@ -1410,6 +1410,7 @@ def buscar_info_escuela(
     query: str,
     score_threshold: Optional[float] = None,
     max_results: int = 8,
+    rewrite_query: bool = True,
 ):
     """
     RAG persistente: busca por significado en el índice vectorial sincronizado desde Odoo.
@@ -1451,7 +1452,7 @@ def buscar_info_escuela(
         vector_store_id=vector_store_id,
         query=query,
         filters=_knowledge_filter(resolved_school),
-        rewrite_query=True,
+        rewrite_query=rewrite_query,
         max_num_results=max_results,
         ranking_options={"score_threshold": threshold},
     )
@@ -2102,6 +2103,9 @@ def _should_prefetch_knowledge(message: Optional[str]) -> bool:
         return False
     if _TRIVIAL_MESSAGE_RE.match(norm):
         return False
+    # Si trae número de pedido, la IA va a consultar Odoo; buscar en Knowledge solo agrega segundos.
+    if re.search(r"\bs\s*-?\s*\d{3,7}\b", norm):
+        return False
     words = re.findall(r"[a-z]{2,}", norm)
     # Solo un número de pedido o un par de palabras: no hay pregunta que buscar.
     if len(words) < 3:
@@ -2225,6 +2229,8 @@ def process_chat(data: ChatRequest) -> dict:
                     query=data.message,
                     score_threshold=KNOWLEDGE_PREFETCH_THRESHOLD,
                     max_results=KNOWLEDGE_PREFETCH_MAX_RESULTS,
+                    # Sin reescribir la pregunta con otro modelo: ahorra ~1-2 s por mensaje.
+                    rewrite_query=False,
                 )
                 if prefetched_knowledge.get("status") == "ok":
                     knowledge_sources.extend([
@@ -2520,31 +2526,11 @@ def _manychat_post(path: str, payload: dict):
 
 
 def _deliver_to_manychat(data: ChatRequest, result: dict):
-    """Guarda el contexto en los campos del contacto y le manda la respuesta por WhatsApp."""
-    subscriber_id = data.contact_id
-    values = {
-        MC_FIELDS["reply"]: result.get("reply"),
-        MC_FIELDS["school"]: result.get("school"),
-        MC_FIELDS["order_number"]: result.get("order_number"),
-        MC_FIELDS["intent"]: result.get("intent"),
-        MC_FIELDS["needs_human"]: bool(result.get("needs_human")),
-        MC_FIELDS["response_id"]: result.get("response_id"),
-        MC_FIELDS["conversation_id"]: result.get("conversation_id"),
-    }
-    for field_name, value in values.items():
-        if value in (None, ""):
-            continue
-        try:
-            _manychat_post("/fb/subscriber/setCustomFieldByName", {
-                "subscriber_id": int(subscriber_id),
-                "field_name": field_name,
-                "field_value": value,
-            })
-        except Exception:
-            logger.warning("No se pudo guardar el campo %s en ManyChat", field_name, exc_info=True)
-
+    """Primero manda la respuesta por WhatsApp (lo que la mamá espera) y luego guarda el contexto."""
+    subscriber_id = int(data.contact_id)
+    started = time.time()
     _manychat_post("/fb/sending/sendContent", {
-        "subscriber_id": int(subscriber_id),
+        "subscriber_id": subscriber_id,
         "data": {
             "version": "v2",
             "content": {
@@ -2553,11 +2539,33 @@ def _deliver_to_manychat(data: ChatRequest, result: dict):
             },
         },
     })
+    logger.info("Respuesta enviada por ManyChat a %s en %.1fs", subscriber_id, time.time() - started)
+
+    values = {
+        MC_FIELDS["conversation_id"]: result.get("conversation_id"),
+        MC_FIELDS["school"]: result.get("school"),
+        MC_FIELDS["order_number"]: result.get("order_number"),
+        MC_FIELDS["intent"]: result.get("intent"),
+        MC_FIELDS["needs_human"]: bool(result.get("needs_human")),
+        MC_FIELDS["response_id"]: result.get("response_id"),
+        MC_FIELDS["reply"]: result.get("reply"),
+    }
+    for field_name, value in values.items():
+        if value in (None, ""):
+            continue
+        try:
+            _manychat_post("/fb/subscriber/setCustomFieldByName", {
+                "subscriber_id": subscriber_id,
+                "field_name": field_name,
+                "field_value": value,
+            })
+        except Exception:
+            logger.warning("No se pudo guardar el campo %s en ManyChat", field_name, exc_info=True)
 
     if result.get("needs_human") and MC_HUMAN_TAG:
         try:
             _manychat_post("/fb/subscriber/addTagByName", {
-                "subscriber_id": int(subscriber_id),
+                "subscriber_id": subscriber_id,
                 "tag_name": MC_HUMAN_TAG,
             })
         except Exception:
