@@ -12,6 +12,7 @@ import time
 import tempfile
 import threading
 import xmlrpc.client
+from difflib import SequenceMatcher
 from urllib.parse import urljoin
 
 import openai
@@ -37,8 +38,8 @@ KNOWLEDGE_SCORE_THRESHOLD = float(os.getenv("KNOWLEDGE_SCORE_THRESHOLD", "0.3"))
 KNOWLEDGE_PREFETCH_THRESHOLD = float(os.getenv("KNOWLEDGE_PREFETCH_THRESHOLD", "0.45"))
 KNOWLEDGE_PREFETCH_MAX_RESULTS = int(os.getenv("KNOWLEDGE_PREFETCH_MAX_RESULTS", "4"))
 KNOWLEDGE_MATCH_MAX_CHARS = int(os.getenv("KNOWLEDGE_MATCH_MAX_CHARS", "1800"))
-# Sincronización automática de Knowledge (horas). 0 la desactiva.
-KNOWLEDGE_AUTO_SYNC_HOURS = float(os.getenv("KNOWLEDGE_AUTO_SYNC_HOURS", "24"))
+# Cada cuántos minutos se revisa Knowledge y se suben solo los cambios. 0 lo desactiva.
+KNOWLEDGE_SYNC_INTERVAL_MINUTES = float(os.getenv("KNOWLEDGE_SYNC_INTERVAL_MINUTES", "15"))
 
 # Los modelos de razonamiento gastan tokens de salida pensando; 700 cortaba respuestas.
 OPENAI_MAX_OUTPUT_TOKENS = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "2500"))
@@ -369,58 +370,156 @@ def _school_registry(uid, models):
     return result
 
 
+def _compact(value: Optional[str]) -> str:
+    return "".join(_school_tokens(value))
+
+
+def _fuzzy_school_score(query: Optional[str], candidate: Optional[str]) -> float:
+    """
+    Parecido aproximado (0-100) para nombres escritos con errores: "monte berde", "edrom",
+    "maristaz", "instituto mexico sec". Tolera letras cambiadas, faltantes, espacios y acentos.
+    """
+    q, c = _compact(query), _compact(candidate)
+    if len(q) < 3 or not c:
+        return 0.0
+    whole = SequenceMatcher(None, q, c).ratio()
+    # Escribió solo el inicio del nombre ("montever", "institutomex").
+    prefix = SequenceMatcher(None, q, c[: len(q)]).ratio() * 0.95 if len(q) >= 4 else 0.0
+    # Palabra por palabra: cada palabra de la mamá contra la más parecida del nombre real.
+    q_tokens, c_tokens = _school_tokens(query), _school_tokens(candidate)
+    token_avg = 0.0
+    if q_tokens and c_tokens:
+        token_avg = sum(
+            max(SequenceMatcher(None, qt, ct).ratio() for ct in c_tokens) for qt in q_tokens
+        ) / len(q_tokens)
+        # Penaliza cuando el nombre real tiene muchas más palabras de las que se parecen.
+        token_avg *= min(1.0, (len(q_tokens) + 1) / (len(c_tokens) + 1) + 0.35)
+    score = 100.0 * max(whole, prefix, token_avg)
+    # Nombres cortos ("Eton", "EDRON"): una letra mal ya baja mucho el porcentaje,
+    # así que contamos errores de dedo directamente.
+    edits = _edit_distance(q, c)
+    if edits <= 1 and len(c) >= 4:
+        score = max(score, 88.0)
+    elif edits <= 2 and len(c) >= 8:
+        score = max(score, 82.0)
+    return round(score, 1)
+
+
+def _edit_distance(a: str, b: str) -> int:
+    """Distancia de Levenshtein (letras cambiadas, faltantes o de más)."""
+    if abs(len(a) - len(b)) > 3:
+        return 99
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+def _school_names(uid, models) -> list[str]:
+    try:
+        return sorted(
+            {item.get("canonical_school") for item in _school_registry(uid, models) if item.get("canonical_school")},
+            key=_norm,
+        )
+    except Exception:
+        logger.warning("No se pudo leer la lista de escuelas", exc_info=True)
+        return []
+
+
 def _resolve_school(uid, models, school: str):
     """
     Resuelve lo que escribió el cliente contra escuelas reales y grupos/sitios de Odoo.
     Una escuela puede vivir dentro de un website de grupo; canonical_school y parent_website son distintos.
+
+    Si no hay coincidencia segura pero sí una parecida (mamá escribió con errores), regresa
+    status=confirm_school con la sugerencia para que la IA pregunte UNA vez "¿Te refieres a X?".
     """
     school = (school or "").strip()
     if not school:
         return {"status": "missing_school"}
 
     registry = _school_registry(uid, models)
+
+    def _ok(item, score, matched_by="nombre"):
+        return {
+            "status": "ok",
+            "input": school,
+            "canonical_school": item.get("canonical_school"),
+            "website_id": item.get("website_id"),
+            "domain": item.get("domain"),
+            "parent_website": item.get("parent_website"),
+            "source": item.get("source"),
+            "source_field": item.get("source_field"),
+            "score": round(score, 1),
+            "matched_by": matched_by,
+        }
+
     scored = []
     for item in registry:
         score = _school_match_score(school, item.get("canonical_school"))
         if score > 0:
             scored.append((score, item))
-
-    if not scored:
-        return {
-            "status": "not_found",
-            "input": school,
-            "message": "No pude relacionar ese nombre con una escuela configurada en Odoo.",
-        }
-
     scored.sort(key=lambda item: (-item[0], _norm(item[1].get("canonical_school"))))
-    best_score, best = scored[0]
-    second_score = scored[1][0] if len(scored) > 1 else 0.0
 
-    if best_score < 58 or (second_score >= best_score - 4 and best_score < 90):
+    if scored:
+        best_score, best = scored[0]
+        second_score = scored[1][0] if len(scored) > 1 else 0.0
+        # Solo el nombre exacto gana sin importar empates; "instituto mexico" no debe elegir
+        # al azar entre Primaria y Secundaria.
+        if best_score >= 58 and not (second_score >= best_score - 4 and best_score < 100):
+            return _ok(best, best_score)
+
+    # Sin coincidencia segura: búsqueda aproximada para errores de dedo.
+    fuzzy = sorted(
+        (
+            (_fuzzy_school_score(school, item.get("canonical_school")), item)
+            for item in registry
+            if item.get("canonical_school")
+        ),
+        key=lambda x: (-x[0], _norm(x[1].get("canonical_school"))),
+    )
+    fuzzy = [(score, item) for score, item in fuzzy if score >= 60]
+
+    if fuzzy:
+        f_best, f_item = fuzzy[0]
+        f_second = fuzzy[1][0] if len(fuzzy) > 1 else 0.0
+        # Una sola escuela parecida (aunque el parecido sea medio) también se confirma directo.
+        if (f_best >= 78 and f_best - f_second >= 6) or (f_best >= 70 and f_second == 0.0):
+            return {
+                "status": "confirm_school",
+                "input": school,
+                "suggestion": f_item.get("canonical_school"),
+                "group": f_item.get("parent_website"),
+                "score": f_best,
+                "message": (
+                    f"Probablemente quiso decir \"{f_item.get('canonical_school')}\". Pregunta UNA sola vez "
+                    "si se refiere a esa escuela. Si confirma, vuelve a llamar la herramienta con ese nombre exacto."
+                ),
+            }
+
+    candidates = []
+    seen = set()
+    for score, item in (fuzzy + scored):
+        name = item.get("canonical_school")
+        if name and name not in seen:
+            seen.add(name)
+            candidates.append({"name": name, "group": item.get("parent_website"), "score": round(score, 1)})
+    if candidates:
         return {
             "status": "ambiguous",
             "input": school,
-            "candidates": [
-                {
-                    "name": item.get("canonical_school"),
-                    "group": item.get("parent_website"),
-                    "score": round(score, 1),
-                }
-                for score, item in scored[:5]
-            ],
-            "message": "El nombre puede corresponder a más de una escuela. Pide al cliente que aclare cuál.",
+            "candidates": candidates[:5],
+            "message": "Puede ser más de una escuela. Pregunta UNA vez cuál de estas es, mostrando las opciones.",
         }
 
     return {
-        "status": "ok",
+        "status": "not_found",
         "input": school,
-        "canonical_school": best.get("canonical_school"),
-        "website_id": best.get("website_id"),
-        "domain": best.get("domain"),
-        "parent_website": best.get("parent_website"),
-        "source": best.get("source"),
-        "source_field": best.get("source_field"),
-        "score": round(best_score, 1),
+        "available_schools": _school_names(uid, models)[:40],
+        "message": "No se parece a ninguna escuela configurada. Pregunta cuál es, mostrando las escuelas disponibles.",
     }
 
 
@@ -579,6 +678,15 @@ def consultar_pedido(school: str, order_number: str):
                 "message": "El pedido pertenece a un grupo que contiene varias escuelas. Pide la escuela específica antes de revelar el estatus.",
             }
 
+        if best_score < 58 and resolved_school.get("status") != "ok":
+            # Escuela mal escrita o dudosa: primero se confirma, no se declara "no corresponde".
+            return {
+                "status": "school_unresolved",
+                "school_input": school,
+                "school_resolution": resolved_school,
+                "message": "Confirma la escuela con el cliente (una sola vez) antes de consultar el pedido.",
+            }
+
         if best_score < 58:
             return {
                 "status": "school_mismatch",
@@ -700,8 +808,9 @@ def _load_knowledge_articles(uid, models, force: bool = False):
 
     fields_meta = _available_fields(uid, models, "knowledge.article")
     read_fields = ["id", "name", "body"]
-    if "write_date" in fields_meta:
-        read_fields.append("write_date")
+    for optional in ("write_date", "parent_id"):
+        if optional in fields_meta:
+            read_fields.append(optional)
 
     # Solo contenido pensado para compartirse: fuera artículos privados del usuario API y plantillas.
     domain = []
@@ -736,11 +845,13 @@ def _load_knowledge_articles(uid, models, force: bool = False):
         name = (row.get("name") or "").strip()
         if not name and not text:
             continue
+        parent = row.get("parent_id")
         cleaned.append({
             "id": row.get("id"),
             "name": name or f"Artículo {row.get('id')}",
             "text": text,
             "write_date": row.get("write_date") or "",
+            "parent_id": parent[0] if isinstance(parent, (list, tuple)) and parent else None,
         })
 
     _KNOWLEDGE_ARTICLE_CACHE.update({"ts": now, "items": cleaned})
@@ -841,6 +952,28 @@ def _infer_article_scope(article: dict, registry: list[dict]) -> dict:
     }
 
 
+def _infer_scope_with_folders(article: dict, by_id: dict, registry: list[dict]) -> dict:
+    """
+    Carpetas por escuela: si el artículo no dice su escuela en el título, la hereda de la
+    página padre (o abuela, etc.). Así basta con crear en Knowledge una página "Monteverde"
+    y meter adentro todos sus artículos.
+    """
+    own = _infer_article_scope(article, registry)
+    if own.get("scope_type") != "global":
+        return own
+
+    seen = {article.get("id")}
+    parent = by_id.get(article.get("parent_id"))
+    while parent and parent.get("id") not in seen and len(seen) < 12:
+        seen.add(parent.get("id"))
+        # Para las carpetas solo cuenta el título (el cuerpo de la carpeta puede mencionar varias escuelas).
+        inherited = _infer_article_scope({"name": parent.get("name"), "text": ""}, registry)
+        if inherited.get("scope_type") != "global":
+            return {**inherited, "inherited_from": parent.get("name")}
+        parent = by_id.get(parent.get("parent_id"))
+    return own
+
+
 def _get_vector_store_id(client: OpenAI, create_if_missing: bool = True) -> Optional[str]:
     """Usa ID fijo si existe; si no, localiza/crea el store por nombre."""
     if OPENAI_KNOWLEDGE_VECTOR_STORE_ID:
@@ -917,6 +1050,11 @@ def _article_file_content(article: dict, scope: dict) -> str:
     )
 
 
+def _article_sync_sig(article: dict, scope: dict) -> str:
+    """Huella de lo que se indexó: si cambia el artículo o su escuela, se vuelve a subir."""
+    return f"{article.get('write_date') or ''}|{scope.get('scope_type')}|{scope.get('scope_key')}"[:500]
+
+
 def _upload_article(client: OpenAI, vector_store_id: str, article: dict, scope: dict):
     safe_title = re.sub(r"[^A-Za-z0-9._-]+", "_", article.get("name") or "article")[:90]
     filename = f"odoo_{article.get('id')}_{safe_title}.txt"
@@ -946,6 +1084,7 @@ def _upload_article(client: OpenAI, vector_store_id: str, article: dict, scope: 
             "article_name": (article.get("name") or "")[:256],
             "write_date": (article.get("write_date") or "")[:256],
             "source": "odoo_knowledge",
+            "sync_sig": _article_sync_sig(article, scope),
         }
         client.vector_stores.files.update(
             vector_store_id=vector_store_id,
@@ -978,6 +1117,7 @@ def sync_knowledge_vector_store():
     if not articles:
         # Nunca vaciar el índice porque Odoo no devolvió nada (error de permisos, etc.).
         raise RuntimeError("Odoo no devolvió artículos de Knowledge; se conservó el índice anterior.")
+    by_id = {a.get("id"): a for a in articles}
     client = OpenAI(api_key=OPENAI_API_KEY, timeout=90.0)
     vector_store_id = _get_vector_store_id(client, create_if_missing=True)
 
@@ -994,7 +1134,7 @@ def sync_knowledge_vector_store():
         if not (article.get("text") or "").strip():
             skipped.append({"id": article.get("id"), "name": article.get("name"), "reason": "empty"})
             continue
-        scope = _infer_article_scope(article, registry)
+        scope = _infer_scope_with_folders(article, by_id, registry)
         try:
             file_id = _upload_article(client, vector_store_id, article, scope)
             indexed.append({
@@ -1047,7 +1187,104 @@ def sync_knowledge_vector_store():
     }
 
 
-def _run_knowledge_sync_job():
+def sync_knowledge_changes():
+    """
+    Sincronización por cambios: solo sube los artículos nuevos o editados (o que cambiaron de
+    escuela/carpeta) y quita los que se borraron en Odoo. Barata, se puede correr seguido.
+    """
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY no configurada")
+
+    uid, models = _odoo()
+    registry = _school_registry(uid, models)
+    articles = _load_knowledge_articles(uid, models, force=True)
+    if not articles:
+        raise RuntimeError("Odoo no devolvió artículos de Knowledge; no se tocó el índice.")
+    by_id = {a.get("id"): a for a in articles}
+
+    desired = {}
+    for article in articles:
+        if not (article.get("text") or "").strip():
+            continue
+        scope = _infer_scope_with_folders(article, by_id, registry)
+        desired[int(article.get("id") or 0)] = (article, scope, _article_sync_sig(article, scope))
+
+    client = OpenAI(api_key=OPENAI_API_KEY, timeout=90.0)
+    vector_store_id = _get_vector_store_id(client, create_if_missing=True)
+
+    existing = {}   # article_id -> [(file_id, sig)]
+    orphans = []    # archivos sin artículo de Odoo asociado
+    for item in _list_vector_store_files(client, vector_store_id):
+        attrs = getattr(item, "attributes", None) or {}
+        try:
+            article_id = int(attrs.get("article_id") or 0)
+        except (TypeError, ValueError):
+            article_id = 0
+        if not article_id:
+            orphans.append(item.id)
+            continue
+        existing.setdefault(article_id, []).append((item.id, attrs.get("sync_sig")))
+
+    def _drop(file_id):
+        try:
+            client.vector_stores.files.delete(vector_store_id=vector_store_id, file_id=file_id)
+        except Exception:
+            logger.warning("No se pudo desvincular archivo %s", file_id, exc_info=True)
+        try:
+            client.files.delete(file_id)
+        except Exception:
+            pass
+
+    uploaded, updated, removed, failed = [], [], 0, []
+    for article_id, (article, scope, sig) in desired.items():
+        current = existing.get(article_id, [])
+        if any(file_sig == sig for _, file_sig in current) and len(current) == 1:
+            continue  # sin cambios
+        keep = [fid for fid, file_sig in current if file_sig == sig][:1]
+        try:
+            if not keep:
+                keep = [_upload_article(client, vector_store_id, article, scope)]
+                (updated if current else uploaded).append(article.get("name"))
+        except Exception as exc:
+            logger.exception("No se pudo indexar Knowledge article %s", article_id)
+            failed.append({"id": article_id, "name": article.get("name"), "reason": str(exc)[:200]})
+            continue
+        # Solo después de tener la versión nueva se borra la anterior.
+        for fid, _ in current:
+            if fid not in keep:
+                _drop(fid)
+                removed += 1
+
+    gone = [aid for aid in existing if aid not in desired]
+    gone_files = sum(len(existing[aid]) for aid in gone)
+    total_files = sum(len(v) for v in existing.values())
+    # Protección: si de golpe "desaparece" casi todo, probablemente es un error de lectura, no un borrado real.
+    if total_files >= 6 and gone_files > 0.6 * total_files:
+        logger.warning("Sync Knowledge: %s de %s archivos se borrarían; se omite por seguridad", gone_files, total_files)
+    else:
+        for aid in gone:
+            for fid, _ in existing[aid]:
+                _drop(fid)
+                removed += 1
+        for fid in orphans:
+            _drop(fid)
+            removed += 1
+
+    return {
+        "status": "ok",
+        "mode": "cambios",
+        "vector_store_id": vector_store_id,
+        "odoo_articles_found": len(articles),
+        "indexed_count": len(desired),
+        "new": uploaded,
+        "updated": updated,
+        "removed_files": removed,
+        "skipped_count": len(failed),
+        "skipped": failed,
+    }
+
+
+def _run_knowledge_sync_job(full: bool = True):
     """Ejecuta la sincronización fuera de la petición HTTP para evitar timeouts del proxy."""
     acquired = _KNOWLEDGE_SYNC_LOCK.acquire(blocking=False)
     if not acquired:
@@ -1061,7 +1298,7 @@ def _run_knowledge_sync_job():
             "result": None,
             "error": None,
         })
-        result = sync_knowledge_vector_store()
+        result = sync_knowledge_vector_store() if full else sync_knowledge_changes()
         _KNOWLEDGE_SYNC_STATE.update({
             "status": "completed",
             "finished_at": datetime.utcnow().isoformat() + "Z",
@@ -1615,8 +1852,21 @@ website de grupo (por ejemplo, una escuela específica dentro de Maristas). Las 
 específica en el pedido, esa escuela tiene prioridad para validar al cliente; el nombre del grupo por sí solo
 puede ser insuficiente. Las herramientas resuelven abreviaciones y siglas contra nombres reales de escuela
 configurados en Odoo. Cuando una herramienta devuelva un nombre canónico de escuela, consérvalo en `school`.
-Si devuelve `specific_school_required`, pregunta la escuela concreta. Si devuelve `school_unresolved` o una
-resolución ambigua, conversa para aclarar; no asumas otra escuela.
+Si devuelve `specific_school_required`, pregunta la escuela concreta.
+
+ESCUELA MAL ESCRITA (muy común: las mamás escriben rápido, con errores, sin acentos o abreviado)
+- En CONTEXTO EXTERNO recibes la lista de ESCUELAS CONFIGURADAS. Si lo que escribió se parece claramente a una
+  sola de ellas ("monte berde", "maristaz", "edrom"), NO le digas que no existe: confirma UNA sola vez de forma
+  breve y natural, por ejemplo: "¿Te refieres a *Monteverde*? 😊". Puedes, en el mismo mensaje, adelantar qué
+  vas a revisar.
+- Si una herramienta devuelve `confirm_school` (o `school_unresolved` con `school_resolution.status=confirm_school`),
+  pregunta exactamente por `suggestion`, una sola vez.
+- Cuando la mamá confirme con cualquier forma afirmativa ("sí", "esa", "ajá", "correcto", 👍, o repite el nombre
+  aunque mal escrito), toma esa escuela como confirmada: llama las herramientas con el nombre EXACTO de la lista,
+  guárdalo en `school` y continúa con lo que había preguntado originalmente, sin que lo tenga que repetir.
+- Nunca vuelvas a preguntar por la escuela una vez confirmada en la conversación o en CONTEXTO EXTERNO.
+- Si dice que no, o si hay varias parecidas (`ambiguous`), muestra las opciones (máximo 5) para que elija.
+- Si no se parece a ninguna, pregunta de nuevo de forma amable; puedes listar las escuelas disponibles.
 
 PEDIDOS
 El formato canónico de SportHouse es S + 5 dígitos, por ejemplo S02038. El cliente NO tiene que escribirlo
@@ -1705,8 +1955,15 @@ Los demás campos son contexto operativo para conservar la conversación.
 
 
 def _external_context(data: ChatRequest, prefetched_knowledge: Optional[dict] = None) -> str:
+    school_list = ""
+    try:
+        uid, models = _odoo()
+        school_list = ", ".join(_school_names(uid, models)[:60])
+    except Exception:
+        logger.warning("No se pudo armar la lista de escuelas para el contexto", exc_info=True)
     return f"""
 CONTEXTO EXTERNO ACTUAL (puede contener valores vacíos):
+- ESCUELAS CONFIGURADAS: {school_list or 'no disponible en este momento'}
 - escuela confirmada: {data.school or 'NO CONOCIDA'}
 - pedido confirmado: {data.order_number or 'NO CONOCIDO'}
 - producto: {data.product or 'NO CONOCIDO'}
@@ -2122,8 +2379,10 @@ def knowledge_status():
 @router.post("/knowledge/sync")
 def knowledge_sync(
     background_tasks: BackgroundTasks,
+    completo: bool = False,
     x_knowledge_sync_key: Optional[str] = Header(default=None, alias="X-Knowledge-Sync-Key"),
 ):
+    """Por defecto sube solo cambios; con ?completo=true reconstruye todo el índice."""
     if not KNOWLEDGE_SYNC_KEY:
         return {
             "status": "error",
@@ -2139,7 +2398,7 @@ def knowledge_sync(
             "started_at": _KNOWLEDGE_SYNC_STATE.get("started_at"),
         }
 
-    background_tasks.add_task(_run_knowledge_sync_job)
+    background_tasks.add_task(_run_knowledge_sync_job, completo)
     return {
         "status": "started",
         "message": "Sincronización iniciada en segundo plano. Consulta GET /knowledge/sync/status para ver el progreso.",
@@ -2161,6 +2420,10 @@ def knowledge_sync_status():
             "indexed_count": result.get("indexed_count"),
             "skipped_count": result.get("skipped_count"),
             "skipped": result.get("skipped", [])[:20],
+            "mode": result.get("mode", "completo"),
+            "new": (result.get("new") or [])[:30],
+            "updated": (result.get("updated") or [])[:30],
+            "removed_files": result.get("removed_files"),
         }
     return state
 
@@ -2259,17 +2522,22 @@ def chat_async(data: ChatRequest):
 
 
 def _knowledge_auto_sync_loop():
-    """Mantiene el índice de Knowledge al día sin que alguien tenga que correr /knowledge/sync."""
-    time.sleep(600)  # deja arrancar el servicio antes de la primera sincronización
+    """Revisa Knowledge cada pocos minutos y sube solo lo que cambió (artículos o carpetas)."""
+    time.sleep(90)  # deja arrancar el servicio antes de la primera revisión
     while True:
-        try:
-            if OPENAI_API_KEY:
-                _run_knowledge_sync_job()
-                logger.info("Sincronización automática de Knowledge: %s", _KNOWLEDGE_SYNC_STATE.get("status"))
-        except Exception:
-            logger.exception("Falló la sincronización automática de Knowledge")
-        time.sleep(max(1.0, KNOWLEDGE_AUTO_SYNC_HOURS) * 3600)
+        if OPENAI_API_KEY and _KNOWLEDGE_SYNC_STATE.get("status") != "running":
+            _run_knowledge_sync_job(full=False)
+            state = _KNOWLEDGE_SYNC_STATE
+            result = state.get("result") or {}
+            if state.get("status") == "failed":
+                logger.warning("Sync automático de Knowledge falló: %s", state.get("error"))
+            elif result.get("new") or result.get("updated") or result.get("removed_files"):
+                logger.info(
+                    "Knowledge actualizado: nuevos=%s editados=%s archivos_quitados=%s",
+                    result.get("new"), result.get("updated"), result.get("removed_files"),
+                )
+        time.sleep(max(1.0, KNOWLEDGE_SYNC_INTERVAL_MINUTES) * 60)
 
 
-if KNOWLEDGE_AUTO_SYNC_HOURS > 0:
+if KNOWLEDGE_SYNC_INTERVAL_MINUTES > 0:
     threading.Thread(target=_knowledge_auto_sync_loop, daemon=True, name="knowledge-auto-sync").start()
