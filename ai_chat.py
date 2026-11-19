@@ -14,12 +14,15 @@ import threading
 import xmlrpc.client
 from urllib.parse import urljoin
 
+import openai
+import requests
 from openai import OpenAI
+from pydantic import field_validator
 
 router = APIRouter()
 logger = logging.getLogger("sporthouse-ai")
 
-ODOO_URL = os.getenv("ODOO_URL")
+ODOO_URL = (os.getenv("ODOO_URL") or "").rstrip("/") or None
 ODOO_DB = os.getenv("ODOO_DB")
 ODOO_USER = os.getenv("ODOO_USER")
 ODOO_PASSWORD = os.getenv("ODOO_PASSWORD")
@@ -28,11 +31,107 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6-luna")
 OPENAI_KNOWLEDGE_VECTOR_STORE_ID = os.getenv("OPENAI_KNOWLEDGE_VECTOR_STORE_ID")
 OPENAI_KNOWLEDGE_VECTOR_STORE_NAME = os.getenv("OPENAI_KNOWLEDGE_VECTOR_STORE_NAME", "SportHouse Knowledge")
 KNOWLEDGE_SYNC_KEY = os.getenv("KNOWLEDGE_SYNC_KEY")
-KNOWLEDGE_SCORE_THRESHOLD = float(os.getenv("KNOWLEDGE_SCORE_THRESHOLD", "0.12"))
+# Umbral de relevancia para la herramienta buscar_info_escuela (antes 0.12: dejaba pasar fragmentos irrelevantes).
+KNOWLEDGE_SCORE_THRESHOLD = float(os.getenv("KNOWLEDGE_SCORE_THRESHOLD", "0.3"))
+# La precarga automática es más estricta: solo entra al contexto lo claramente relevante.
+KNOWLEDGE_PREFETCH_THRESHOLD = float(os.getenv("KNOWLEDGE_PREFETCH_THRESHOLD", "0.45"))
+KNOWLEDGE_PREFETCH_MAX_RESULTS = int(os.getenv("KNOWLEDGE_PREFETCH_MAX_RESULTS", "4"))
+KNOWLEDGE_MATCH_MAX_CHARS = int(os.getenv("KNOWLEDGE_MATCH_MAX_CHARS", "1800"))
+# Sincronización automática de Knowledge (horas). 0 la desactiva.
+KNOWLEDGE_AUTO_SYNC_HOURS = float(os.getenv("KNOWLEDGE_AUTO_SYNC_HOURS", "24"))
+
+# Los modelos de razonamiento gastan tokens de salida pensando; 700 cortaba respuestas.
+OPENAI_MAX_OUTPUT_TOKENS = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "2500"))
+OPENAI_REASONING_EFFORT = (os.getenv("OPENAI_REASONING_EFFORT", "low") or "").strip().lower()
+OPENAI_TIMEOUT = float(os.getenv("OPENAI_TIMEOUT", "25"))
+ODOO_TIMEOUT = float(os.getenv("ODOO_TIMEOUT", "8"))
+
+MANYCHAT_API_KEY = os.getenv("MANYCHAT_API_KEY", "")
+MANYCHAT_API = "https://api.manychat.com"
+# Etiqueta que se pone al contacto cuando la IA pide un asesor humano (modo /chat_async). Vacío = no etiquetar.
+MC_HUMAN_TAG = os.getenv("MC_HUMAN_TAG", "")
+
+# Nombres de los campos personalizados de ManyChat que usa el flujo "Agente Sporthouse".
+MC_FIELDS = {
+    "reply": os.getenv("MC_FIELD_REPLY", "ai_reply"),
+    "school": os.getenv("MC_FIELD_SCHOOL", "escuela_usuario"),
+    "order_number": os.getenv("MC_FIELD_ORDER", "odoo_order_number"),
+    "intent": os.getenv("MC_FIELD_INTENT", "mc_intent"),
+    "needs_human": os.getenv("MC_FIELD_NEEDS_HUMAN", "ai_needs_human"),
+    "response_id": os.getenv("MC_FIELD_RESPONSE_ID", "ai_response_id"),
+    "conversation_id": os.getenv("MC_FIELD_CONVERSATION_ID", "ai_conversation_id"),
+}
+
+
+# ----------------------------------------------------------------------
+# Clientes compartidos (antes se creaban y autenticaban en cada mensaje)
+# ----------------------------------------------------------------------
+
+_OPENAI_CLIENT = None
+_OPENAI_CLIENT_LOCK = threading.Lock()
+
+
+def _openai_client() -> OpenAI:
+    """Cliente único. Pocos reintentos: un 429 por falta de crédito no se arregla reintentando."""
+    global _OPENAI_CLIENT
+    if _OPENAI_CLIENT is None:
+        with _OPENAI_CLIENT_LOCK:
+            if _OPENAI_CLIENT is None:
+                _OPENAI_CLIENT = OpenAI(
+                    api_key=OPENAI_API_KEY,
+                    timeout=OPENAI_TIMEOUT,
+                    max_retries=1,
+                )
+    return _OPENAI_CLIENT
+
+
+class _TimeoutTransport(xmlrpc.client.Transport):
+    def __init__(self, timeout: float, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._timeout = timeout
+
+    def make_connection(self, host):
+        conn = super().make_connection(host)
+        conn.timeout = self._timeout
+        return conn
+
+
+class _TimeoutSafeTransport(xmlrpc.client.SafeTransport):
+    def __init__(self, timeout: float, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._timeout = timeout
+
+    def make_connection(self, host):
+        conn = super().make_connection(host)
+        conn.timeout = self._timeout
+        return conn
+
+
+def _odoo_proxy(path: str) -> xmlrpc.client.ServerProxy:
+    """Proxy nuevo por llamada (no es thread-safe compartirlo), con límite de tiempo."""
+    url = f"{ODOO_URL}{path}"
+    transport = (
+        _TimeoutSafeTransport(ODOO_TIMEOUT)
+        if url.startswith("https://")
+        else _TimeoutTransport(ODOO_TIMEOUT)
+    )
+    return xmlrpc.client.ServerProxy(url, transport=transport, allow_none=True)
+
+
+_ODOO_UID_CACHE = {"uid": None, "ts": 0.0}
+_ODOO_UID_TTL = 1800
+
+_FIELDS_CACHE: dict = {}
+_FIELDS_CACHE_TTL = 3600
+
+
+def _is_placeholder(value) -> bool:
+    """ManyChat manda el texto literal {{cuf_123}} cuando el campo está vacío."""
+    return isinstance(value, str) and bool(re.fullmatch(r"\s*\{\{[^{}]*\}\}\s*", value))
 
 
 class ChatRequest(BaseModel):
-    message: str
+    message: Optional[str] = None
     contact_id: Optional[str] = None
     phone: Optional[str] = None
     first_name: Optional[str] = None
@@ -50,6 +149,19 @@ class ChatRequest(BaseModel):
 
     # Compatibilidad temporal con la versión anterior. Ya no es la memoria principal.
     previous_response_id: Optional[str] = None
+
+    @field_validator("*", mode="before")
+    @classmethod
+    def _clean_manychat_value(cls, value):
+        # Campos vacíos de ManyChat llegan como "{{cuf_XXXX}}"; los tratamos como vacíos.
+        if _is_placeholder(value):
+            return None
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return str(value)
+        if isinstance(value, str):
+            value = value.strip()
+            return value or None
+        return value
 
 
 def _norm(value: Optional[str]) -> str:
@@ -147,11 +259,7 @@ def _sale_order_school_fields(uid, models):
     No codifica escuelas individuales: usa el nombre visible del campo (p. ej. "Escuela Marista").
     """
     try:
-        fields = models.execute_kw(
-            ODOO_DB, uid, ODOO_PASSWORD,
-            "sale.order", "fields_get", [],
-            {"attributes": ["type", "string", "selection"]},
-        ) or {}
+        fields = _fields_get(uid, models, "sale.order", ["type", "string", "selection"])
     except Exception:
         logger.warning("No se pudieron descubrir campos de escuela en sale.order", exc_info=True)
         return {}
@@ -352,13 +460,32 @@ def _odoo():
     if missing:
         raise RuntimeError(f"Faltan variables de Odoo: {', '.join(missing)}")
 
-    common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
-    uid = common.authenticate(ODOO_DB, ODOO_USER, ODOO_PASSWORD, {})
-    if not uid:
-        raise RuntimeError("No se pudo autenticar con Odoo")
+    # El uid no cambia: antes se iniciaba sesión en Odoo en cada herramienta de cada mensaje.
+    now = time.time()
+    uid = _ODOO_UID_CACHE.get("uid")
+    if not uid or now - _ODOO_UID_CACHE.get("ts", 0.0) > _ODOO_UID_TTL:
+        uid = _odoo_proxy("/xmlrpc/2/common").authenticate(ODOO_DB, ODOO_USER, ODOO_PASSWORD, {})
+        if not uid:
+            raise RuntimeError("No se pudo autenticar con Odoo")
+        _ODOO_UID_CACHE.update({"uid": uid, "ts": now})
 
-    models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
-    return uid, models
+    return uid, _odoo_proxy("/xmlrpc/2/object")
+
+
+def _fields_get(uid, models, model_name: str, attributes: list[str]):
+    """fields_get con caché: la estructura de los modelos casi nunca cambia."""
+    key = (model_name, tuple(attributes))
+    cached = _FIELDS_CACHE.get(key)
+    now = time.time()
+    if cached and now - cached["ts"] < _FIELDS_CACHE_TTL:
+        return cached["fields"]
+    fields = models.execute_kw(
+        ODOO_DB, uid, ODOO_PASSWORD,
+        model_name, "fields_get", [],
+        {"attributes": attributes},
+    ) or {}
+    _FIELDS_CACHE[key] = {"ts": now, "fields": fields}
+    return fields
 
 
 def consultar_pedido(school: str, order_number: str):
@@ -370,7 +497,12 @@ def consultar_pedido(school: str, order_number: str):
     sobre website_id para validar la escuela del cliente.
     """
     school = (school or "").strip()
-    order_number = re.sub(r"[\s#\-]", "", (order_number or "").upper())
+    order_number = re.sub(r"[\s#\-_.]", "", (order_number or "").upper())
+    # "S413" / "s 2038" / "S002038" -> S00413 / S02038. Solo se rellenan ceros a la izquierda.
+    match = re.fullmatch(r"S(\d{1,7})", order_number)
+    if match:
+        digits = match.group(1).lstrip("0") or "0"
+        order_number = "S" + digits.zfill(5)
 
     if not school:
         return {
@@ -378,7 +510,7 @@ def consultar_pedido(school: str, order_number: str):
             "message": "Falta la escuela. Pregunta al cliente antes de consultar el pedido.",
         }
 
-    if not re.fullmatch(r"S\d{5}", order_number):
+    if not re.fullmatch(r"S\d{5,7}", order_number):
         return {
             "status": "invalid_format",
             "received": order_number,
@@ -481,28 +613,62 @@ def consultar_pedido(school: str, order_number: str):
             }
         school_source_field = None
 
+    picking_meta = _fields_get(uid, models, "stock.picking", ["type", "string", "selection"])
+    status_field = "x_studio_estado_sporthouse"
+    picking_fields = [
+        f for f in ("id", "name", "state", status_field, "picking_type_code", "date_done", "scheduled_date")
+        if f in picking_meta
+    ]
+    # sale_id liga la entrega al pedido aunque el "origen" se haya editado; origin queda como respaldo.
+    if "sale_id" in picking_meta:
+        picking_domain = ["|", ["sale_id", "=", order["id"]], ["origin", "=", order_number]]
+    else:
+        picking_domain = [["origin", "=", order_number]]
+
     pickings = models.execute_kw(
         ODOO_DB, uid, ODOO_PASSWORD,
         "stock.picking", "search_read",
-        [[['origin', '=', order_number]]],
-        {
-            "fields": ["state", "x_studio_estado_sporthouse"],
-            "limit": 1,
-            "order": "id desc",
-        },
+        [picking_domain],
+        {"fields": picking_fields, "limit": 30, "order": "id desc"},
+    ) or []
+
+    def _status_label(row):
+        # Si el campo es de selección, Odoo regresa la clave interna; usamos la etiqueta visible.
+        return _field_value_label(picking_meta.get(status_field) or {}, row.get(status_field))
+
+    active = [p for p in pickings if p.get("state") != "cancel"] or pickings
+    # Antes se tomaba solo la última transferencia (podía ser una devolución o un paso interno).
+    # Prioridad: la que tiene Estado SportHouse; dentro de esas, la de salida al cliente; luego la más reciente.
+    active.sort(
+        key=lambda p: (
+            1 if _status_label(p) else 0,
+            1 if p.get("picking_type_code") == "outgoing" else 0,
+            p.get("id") or 0,
+        ),
+        reverse=True,
     )
+    picking = active[0] if active else {}
 
-    picking = pickings[0] if pickings else {}
-
-    return {
+    result = {
         "status": "ok",
         "order_number": order_number,
         "school": canonical_school,
         "website_group": website_name or None,
         "school_source_field": school_source_field,
-        "sporthouse_status": picking.get("x_studio_estado_sporthouse") or None,
+        "sporthouse_status": _status_label(picking) if picking else None,
         "internal_delivery_state": picking.get("state") or None,
     }
+    if not picking:
+        result["note"] = "El pedido existe pero todavía no tiene entregas registradas."
+
+    # Si hay varias entregas (parciales, por ejemplo), se informan todas para no confundir al cliente.
+    labeled = [p for p in active if _status_label(p)]
+    if len(labeled) > 1:
+        result["entregas"] = [
+            {"entrega": p.get("name"), "sporthouse_status": _status_label(p)}
+            for p in labeled[:5]
+        ]
+    return result
 
 
 
@@ -537,16 +703,32 @@ def _load_knowledge_articles(uid, models, force: bool = False):
     if "write_date" in fields_meta:
         read_fields.append("write_date")
 
-    rows = models.execute_kw(
-        ODOO_DB, uid, ODOO_PASSWORD,
-        "knowledge.article", "search_read",
-        [[]],
-        {
-            "fields": read_fields,
-            "order": "name asc",
-            "limit": 3000,
-        },
-    ) or []
+    # Solo contenido pensado para compartirse: fuera artículos privados del usuario API y plantillas.
+    domain = []
+    if "category" in fields_meta:
+        domain.append(["category", "!=", "private"])
+    if "is_template" in fields_meta:
+        domain.append(["is_template", "=", False])
+    if "to_delete" in fields_meta:
+        domain.append(["to_delete", "=", False])
+
+    def _read(dom):
+        return models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD,
+            "knowledge.article", "search_read",
+            [dom],
+            {
+                "fields": read_fields,
+                "order": "name asc",
+                "limit": 3000,
+            },
+        ) or []
+
+    rows = _read(domain)
+    if not rows and domain:
+        # Si todo el contenido vive en la sección privada del usuario API, no lo perdemos.
+        logger.warning("Knowledge: el filtro de artículos privados/plantillas dejó 0 artículos; se usan todos")
+        rows = _read([])
 
     cleaned = []
     for row in rows:
@@ -793,6 +975,9 @@ def sync_knowledge_vector_store():
     uid, models = _odoo()
     registry = _school_registry(uid, models)
     articles = _load_knowledge_articles(uid, models, force=True)
+    if not articles:
+        # Nunca vaciar el índice porque Odoo no devolvió nada (error de permisos, etc.).
+        raise RuntimeError("Odoo no devolvió artículos de Knowledge; se conservó el índice anterior.")
     client = OpenAI(api_key=OPENAI_API_KEY, timeout=90.0)
     vector_store_id = _get_vector_store_id(client, create_if_missing=True)
 
@@ -917,11 +1102,17 @@ def _result_text(result) -> str:
     return "\n".join(chunks).strip()
 
 
-def buscar_info_escuela(school: str, query: str):
+def buscar_info_escuela(
+    school: str,
+    query: str,
+    score_threshold: Optional[float] = None,
+    max_results: int = 8,
+):
     """
     RAG persistente: busca por significado en el índice vectorial sincronizado desde Odoo.
     Filtra antes de buscar para no mezclar escuelas/grupos.
     """
+    threshold = KNOWLEDGE_SCORE_THRESHOLD if score_threshold is None else score_threshold
     school = (school or "").strip()
     query = (query or "").strip()
     if not school:
@@ -944,7 +1135,7 @@ def buscar_info_escuela(school: str, query: str):
             "message": "No pude identificar de forma segura la escuela. Pide una aclaración.",
         }
 
-    client = OpenAI(api_key=OPENAI_API_KEY)
+    client = _openai_client()
     vector_store_id = _get_vector_store_id(client, create_if_missing=False)
     if not vector_store_id:
         return {
@@ -958,19 +1149,21 @@ def buscar_info_escuela(school: str, query: str):
         query=query,
         filters=_knowledge_filter(resolved_school),
         rewrite_query=True,
-        max_num_results=10,
-        ranking_options={"score_threshold": KNOWLEDGE_SCORE_THRESHOLD},
+        max_num_results=max_results,
+        ranking_options={"score_threshold": threshold},
     )
 
     matches = []
     for result in getattr(results, "data", []) or []:
         score = float(getattr(result, "score", 0.0) or 0.0)
-        if score < KNOWLEDGE_SCORE_THRESHOLD:
+        if score < threshold:
             continue
         attrs = getattr(result, "attributes", None) or {}
         text = _result_text(result)
         if not text:
             continue
+        if len(text) > KNOWLEDGE_MATCH_MAX_CHARS:
+            text = text[:KNOWLEDGE_MATCH_MAX_CHARS].rsplit(" ", 1)[0] + " …"
         matches.append({
             "article_id": attrs.get("article_id"),
             "article_name": attrs.get("article_name") or getattr(result, "filename", None),
@@ -1019,12 +1212,7 @@ def _format_prefetched_knowledge(prefetched: Optional[dict]) -> str:
 def _available_fields(uid, models, model_name: str):
     """Lee los campos reales del modelo para tolerar diferencias entre bases/versiones de Odoo."""
     try:
-        return models.execute_kw(
-            ODOO_DB, uid, ODOO_PASSWORD,
-            model_name, "fields_get",
-            [],
-            {"attributes": ["type"]},
-        ) or {}
+        return _fields_get(uid, models, model_name, ["type"])
     except Exception:
         logger.warning("No se pudieron leer fields_get de %s", model_name, exc_info=True)
         return {}
@@ -1089,24 +1277,43 @@ def buscar_producto_escuela(school: str, query: str):
         if optional in product_fields:
             read_fields.append(optional)
 
-    # La integración existente de SportHouse ya organiza los productos por categoría/escuela.
-    # Eso actúa como frontera principal para no mezclar catálogos entre colegios.
-    domain = [["categ_id.name", "ilike", canonical_school]]
-    if "active" in product_fields:
-        domain.append(["active", "=", True])
-    if "sale_ok" in product_fields:
-        domain.append(["sale_ok", "=", True])
+    # Frontera de catálogo para no mezclar colegios. Antes solo se buscaba la categoría con el nombre
+    # de la escuela concreta, así que una escuela dentro de un grupo (p. ej. IMS en Maristas) no encontraba nada.
+    group_name = resolved_school.get("parent_website")
+    scope_clauses = [
+        ["categ_id.complete_name", "ilike", name]
+        for name in dict.fromkeys(n for n in (canonical_school, group_name) if n)
+    ]
+    if school_website_id and "website_id" in product_fields:
+        scope_clauses.append(["website_id", "=", school_website_id])
 
-    products = models.execute_kw(
-        ODOO_DB, uid, ODOO_PASSWORD,
-        "product.template", "search_read",
-        [domain],
-        {
-            "fields": read_fields,
-            "limit": 120,
-            "order": "name asc",
-        },
-    )
+    base_domain = _or_domain(scope_clauses)
+    if "active" in product_fields:
+        base_domain.append(["active", "=", True])
+    if "sale_ok" in product_fields:
+        base_domain.append(["sale_ok", "=", True])
+
+    # Antes se leían los primeros 120 productos en orden alfabético y luego se buscaba ahí:
+    # si la escuela tenía más, contestaba que no existía algo que sí existe. Ahora Odoo filtra por palabra.
+    query_tokens_db = [
+        t for t in re.findall(r"[a-z0-9]+", _norm(query))
+        if len(t) >= 3 and t not in _PRODUCT_QUERY_STOPWORDS
+    ]
+    products = []
+    if query_tokens_db:
+        products = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD,
+            "product.template", "search_read",
+            [base_domain + _or_domain([["name", "ilike", t] for t in query_tokens_db[:6]])],
+            {"fields": read_fields, "limit": 80, "order": "name asc"},
+        ) or []
+    if not products:
+        products = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD,
+            "product.template", "search_read",
+            [base_domain],
+            {"fields": read_fields, "limit": 200, "order": "name asc"},
+        ) or []
 
     if not products:
         return {
@@ -1137,7 +1344,12 @@ def buscar_producto_escuela(school: str, query: str):
         }
 
     query_norm = _norm(query)
-    query_tokens = [t for t in re.findall(r"[a-z0-9]+", query_norm) if len(t) >= 2]
+    query_tokens = [
+        t for t in re.findall(r"[a-z0-9]+", query_norm)
+        if len(t) >= 2 and t not in _PRODUCT_QUERY_STOPWORDS
+    ]
+    school_norm = _norm(canonical_school)
+    prefer_specific = bool(group_name) and _norm(group_name) != school_norm
 
     candidates = []
     for product in products:
@@ -1150,6 +1362,12 @@ def buscar_producto_escuela(school: str, query: str):
         for token in query_tokens:
             if token in name_norm:
                 score += 10
+
+        category = product.get("categ_id")
+        category_name = category[1] if isinstance(category, (list, tuple)) and len(category) > 1 else None
+        # Dentro de un grupo, primero los productos de la escuela concreta.
+        if prefer_specific and school_norm and school_norm in _norm(category_name):
+            score += 5
 
         website_id_value = product.get("website_id")
         product_website_id = (
@@ -1170,10 +1388,9 @@ def buscar_producto_escuela(school: str, query: str):
         if published is False:
             product_url = None
 
-        category = product.get("categ_id")
         candidates.append({
             "name": name,
-            "category": category[1] if isinstance(category, (list, tuple)) and len(category) > 1 else None,
+            "category": category_name,
             "product_url": product_url,
             "published": published,
             "_score": score,
@@ -1194,13 +1411,28 @@ def buscar_producto_escuela(school: str, query: str):
         "query": query,
         "school_website_id": school_website_id,
         "school_shop_url": school_shop_url,
-        "total_products_in_school": len(products),
+        "products_considered": len(products),
         "candidates": selected,
         "inventory_policy": (
             "No afirmar hay/no hay stock con esta herramienta. "
             "Dirigir al cliente al producto o a la tienda de la escuela para revisar opciones y comprar."
         ),
     }
+
+
+_PRODUCT_QUERY_STOPWORDS = {
+    "de", "del", "la", "las", "el", "los", "un", "una", "unos", "unas", "para", "con", "sin", "por",
+    "que", "tienen", "tiene", "venden", "vende", "hay", "busco", "quiero", "necesito", "talla", "tallas",
+    "precio", "cuanto", "cuesta", "link", "liga", "comprar", "donde", "mi", "hijo", "hija",
+}
+
+
+def _or_domain(clauses: list) -> list:
+    """Combina condiciones con OR en notación de dominio de Odoo."""
+    clauses = [c for c in clauses if c]
+    if not clauses:
+        return []
+    return ["|"] * (len(clauses) - 1) + list(clauses)
 
 
 def escalar_asesor(reason: str):
@@ -1486,7 +1718,7 @@ CONOCIMIENTO RECUPERADO AUTOMÁTICAMENTE PARA ESTE TURNO:
 {_format_prefetched_knowledge(prefetched_knowledge)}
 
 MENSAJE NUEVO DEL CLIENTE:
-{data.message.strip()}
+{(data.message or '').strip()}
 """.strip()
 
 
@@ -1500,9 +1732,22 @@ def _fallback_context(data: ChatRequest):
     }
 
 
+class _ModelOutputError(RuntimeError):
+    """El modelo no devolvió un JSON final válido (p. ej. se quedó sin tokens)."""
+
+
 def _parse_final_response(response, data: ChatRequest, needs_human_from_tool=False, escalation_reason_from_tool=None):
-    raw = (response.output_text or "").strip()
-    parsed = json.loads(raw)
+    status = getattr(response, "status", None)
+    raw = (getattr(response, "output_text", None) or "").strip()
+    if status == "incomplete" or not raw:
+        details = getattr(response, "incomplete_details", None)
+        raise _ModelOutputError(f"Respuesta incompleta del modelo: status={status} details={details}")
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise _ModelOutputError(f"JSON inválido del modelo: {raw[:200]}") from exc
+    if not (parsed.get("reply") or "").strip():
+        raise _ModelOutputError("El modelo devolvió reply vacío")
 
     # El modelo administra el contexto. Solo usamos el contexto previo como fallback
     # si por alguna razón un campo viene vacío sin que se haya confirmado un reemplazo.
@@ -1520,118 +1765,93 @@ def _parse_final_response(response, data: ChatRequest, needs_human_from_tool=Fal
     return parsed
 
 
-@router.get("/knowledge/search")
-async def knowledge_search_debug(
-    school: str,
-    query: str,
-    x_knowledge_sync_key: Optional[str] = Header(default=None, alias="X-Knowledge-Sync-Key"),
-):
-    """Diagnóstico genérico del RAG. No lo usa ManyChat; sirve para verificar qué Knowledge recupera una consulta."""
-    if not KNOWLEDGE_SYNC_KEY or x_knowledge_sync_key != KNOWLEDGE_SYNC_KEY:
-        return {"status": "unauthorized", "message": "Sync key inválida."}
-    try:
-        result = buscar_info_escuela(school=school, query=query)
-        # Limitar texto para que Swagger sea legible, conservando título/score/fuente.
-        if result.get("status") == "ok":
-            compact = dict(result)
-            compact["matches"] = [
-                {**item, "text": (item.get("text") or "")[:1800]}
-                for item in (result.get("matches") or [])[:10]
-            ]
-            return compact
-        return result
-    except Exception as exc:
-        logger.exception("Error en GET /knowledge/search")
-        return {
-            "status": "error",
-            "error_type": type(exc).__name__,
-            "message": str(exc),
-        }
+# Mensajes que no necesitan buscar en Knowledge antes de contestar (ahorra tiempo y evita
+# meterle a la IA fragmentos irrelevantes como si fueran la respuesta).
+_TRIVIAL_MESSAGE_RE = re.compile(
+    r"^(hola|buen[oa]s?( dias| tardes| noches)?|gracias|muchas gracias|ok|okay|va|sale|perfecto|"
+    r"si|no|listo|claro|de acuerdo|excelente|genial|mil gracias|bye|adios)[\s!.,?¡¿]*$"
+)
 
 
-@router.get("/knowledge/status")
-async def knowledge_status():
-    if not OPENAI_API_KEY:
-        return {"status": "error", "message": "OPENAI_API_KEY no configurada"}
-    client = OpenAI(api_key=OPENAI_API_KEY)
-    vector_store_id = _get_vector_store_id(client, create_if_missing=False)
-    if not vector_store_id:
-        return {
-            "status": "not_synced",
-            "vector_store_name": OPENAI_KNOWLEDGE_VECTOR_STORE_NAME,
-            "sync_key_configured": bool(KNOWLEDGE_SYNC_KEY),
-        }
-    try:
-        store = client.vector_stores.retrieve(vector_store_id=vector_store_id)
-        counts = getattr(store, "file_counts", None)
-        if hasattr(counts, "model_dump"):
-            counts = counts.model_dump()
-        return {
-            "status": "ok",
-            "vector_store_id": vector_store_id,
-            "vector_store_name": getattr(store, "name", OPENAI_KNOWLEDGE_VECTOR_STORE_NAME),
-            "file_counts": counts,
-            "sync_key_configured": bool(KNOWLEDGE_SYNC_KEY),
-        }
-    except Exception as exc:
-        return {"status": "error", "message": str(exc)}
+def _should_prefetch_knowledge(message: Optional[str]) -> bool:
+    norm = _norm(message)
+    if not norm:
+        return False
+    if _TRIVIAL_MESSAGE_RE.match(norm):
+        return False
+    words = re.findall(r"[a-z]{2,}", norm)
+    # Solo un número de pedido o un par de palabras: no hay pregunta que buscar.
+    if len(words) < 3:
+        return False
+    return True
 
 
-@router.post("/knowledge/sync")
-async def knowledge_sync(
-    background_tasks: BackgroundTasks,
-    x_knowledge_sync_key: Optional[str] = Header(default=None, alias="X-Knowledge-Sync-Key"),
-):
-    if not KNOWLEDGE_SYNC_KEY:
-        return {
-            "status": "error",
-            "message": "Configura KNOWLEDGE_SYNC_KEY en Railway antes de habilitar la sincronización.",
-        }
-    if x_knowledge_sync_key != KNOWLEDGE_SYNC_KEY:
-        return {"status": "unauthorized", "message": "Sync key inválida."}
+_MODEL_ACCEPTS_REASONING = {"value": None}
 
-    if _KNOWLEDGE_SYNC_STATE.get("status") == "running":
-        return {
-            "status": "already_running",
-            "message": _KNOWLEDGE_SYNC_STATE.get("message"),
-            "started_at": _KNOWLEDGE_SYNC_STATE.get("started_at"),
-        }
 
-    background_tasks.add_task(_run_knowledge_sync_job)
+def _model_maybe_reasoning() -> bool:
+    name = (OPENAI_MODEL or "").lower()
+    return bool(OPENAI_REASONING_EFFORT) and (name.startswith("gpt-5") or re.match(r"^o\d", name) is not None)
+
+
+def _is_conversation_error(exc: Exception) -> bool:
+    if not isinstance(exc, (openai.BadRequestError, openai.NotFoundError)):
+        return False
+    return "conversation" in str(exc).lower()
+
+
+def _openai_failure_reason(exc: Exception) -> str:
+    text = str(exc)
+    if isinstance(exc, openai.RateLimitError) and (
+        "insufficient_quota" in text or "credit_balance_exhausted" in text
+    ):
+        return "openai_sin_credito"
+    if isinstance(exc, openai.RateLimitError):
+        return "openai_rate_limit"
+    if isinstance(exc, openai.AuthenticationError):
+        return "openai_api_key_invalida"
+    if isinstance(exc, (openai.APITimeoutError, openai.APIConnectionError)):
+        return "openai_timeout"
+    if isinstance(exc, _ModelOutputError):
+        return "respuesta_incompleta_del_modelo"
+    return "backend_error"
+
+
+# Un solo turno a la vez por contacto: dos mensajes seguidos de la misma mamá no deben
+# correr en paralelo sobre la misma conversación (se cruzaban respuestas).
+_CONTACT_LOCKS: dict = {}
+_CONTACT_LOCKS_GUARD = threading.Lock()
+
+
+def _contact_lock(data: ChatRequest) -> threading.Lock:
+    key = data.contact_id or data.phone or data.conversation_id or "_anon"
+    with _CONTACT_LOCKS_GUARD:
+        lock = _CONTACT_LOCKS.get(key)
+        if lock is None:
+            if len(_CONTACT_LOCKS) > 5000:
+                _CONTACT_LOCKS.clear()
+            lock = threading.Lock()
+            _CONTACT_LOCKS[key] = lock
+        return lock
+
+
+def _error_result(data: ChatRequest, reason: str, conversation_id, tools_used, knowledge_sources):
     return {
-        "status": "started",
-        "message": "Sincronización iniciada en segundo plano. Consulta GET /knowledge/sync/status para ver el progreso.",
+        "reply": "Tuve un problema al revisar la información. Un asesor de SportHouse te ayudará en breve. 🙏",
+        **_fallback_context(data),
+        "needs_human": True,
+        "escalation_reason": reason,
+        "conversation_id": conversation_id,
+        "response_id": data.previous_response_id,
+        "tools_used": tools_used,
+        "knowledge_sources": list(dict.fromkeys(knowledge_sources)),
     }
 
 
-@router.get("/knowledge/sync/status")
-async def knowledge_sync_status():
-    state = dict(_KNOWLEDGE_SYNC_STATE)
-    result = state.get("result")
-    # Evitamos devolver cientos de artículos en cada consulta de progreso.
-    if isinstance(result, dict):
-        state["result"] = {
-            "status": result.get("status"),
-            "vector_store_id": result.get("vector_store_id"),
-            "vector_store_name": result.get("vector_store_name"),
-            "removed_previous_files": result.get("removed_previous_files"),
-            "odoo_articles_found": result.get("odoo_articles_found"),
-            "indexed_count": result.get("indexed_count"),
-            "skipped_count": result.get("skipped_count"),
-            "skipped": result.get("skipped", [])[:20],
-        }
-    return state
-
-
-@router.post("/chat")
-async def chat(data: ChatRequest):
-    """
-    Entrada única del agente SportHouse.
-
-    La memoria principal vive en un objeto Conversation de OpenAI, no en una cadena frágil
-    de previous_response_id. ManyChat solo necesita conservar `conversation_id`.
-    """
-    if not data.message or not data.message.strip():
+def process_chat(data: ChatRequest) -> dict:
+    """Lógica completa de un turno. La usan /chat (síncrono) y /chat_async (en segundo plano)."""
+    started = time.time()
+    if not data.message:
         return {
             "reply": "¿En qué puedo ayudarte? 😊",
             **_fallback_context(data),
@@ -1644,92 +1864,95 @@ async def chat(data: ChatRequest):
         }
 
     if not OPENAI_API_KEY:
-        return {
-            "reply": "En este momento no puedo procesar tu mensaje. Un asesor de SportHouse puede ayudarte.",
-            **_fallback_context(data),
-            "needs_human": True,
-            "escalation_reason": "openai_not_configured",
-            "conversation_id": data.conversation_id,
-            "response_id": data.previous_response_id,
-            "tools_used": [],
-            "knowledge_sources": [],
-        }
+        return _error_result(data, "openai_not_configured", data.conversation_id, [], [])
 
-    client = OpenAI(api_key=OPENAI_API_KEY)
+    client = _openai_client()
     tools_used = []
     knowledge_sources = []
     needs_human_from_tool = False
     escalation_reason_from_tool = None
-
-    # ------------------------------------------------------------------
-    # 1) Conversación persistente
-    # ------------------------------------------------------------------
-    conversation_id = (data.conversation_id or "").strip() or None
-    conversation_was_created = False
-
-    if not conversation_id:
-        metadata = {"source": "manychat-sporthouse"}
-        if data.contact_id:
-            # metadata values must be short strings
-            metadata["contact_id"] = str(data.contact_id)[:512]
-        conversation = client.conversations.create(metadata=metadata)
-        conversation_id = conversation.id
-        conversation_was_created = True
-
-    # ------------------------------------------------------------------
-    # 2) Prefetch de Knowledge cuando ManyChat ya conoce la escuela.
-    #    Si la escuela aparece por primera vez en el mensaje actual, el modelo puede
-    #    resolverla y llamar buscar_info_escuela dentro del mismo turno.
-    # ------------------------------------------------------------------
-    prefetched_knowledge = None
-    if data.school:
-        try:
-            prefetched_knowledge = buscar_info_escuela(
-                school=data.school,
-                query=data.message,
-            )
-            if prefetched_knowledge.get("status") == "ok":
-                knowledge_sources.extend([
-                    item.get("article_name")
-                    for item in prefetched_knowledge.get("matches") or []
-                    if item.get("article_name")
-                ])
-        except Exception:
-            logger.warning("No se pudo precargar Knowledge; el agente podrá buscarlo como tool", exc_info=True)
-            prefetched_knowledge = None
-
-    def _create_response(input_items):
-        return client.responses.create(
-            model=OPENAI_MODEL,
-            instructions=INSTRUCTIONS,
-            conversation=conversation_id,
-            input=input_items,
-            tools=TOOLS,
-            tool_choice="auto",
-            text={"format": FINAL_RESPONSE_FORMAT},
-            max_output_tokens=700,
-        )
+    conversation_id = data.conversation_id
 
     try:
-        try:
-            response = _create_response([
-                {"role": "user", "content": _external_context(data, prefetched_knowledge)}
-            ])
-        except Exception:
-            # Si ManyChat trae un conversation_id viejo/inválido, recuperamos creando uno nuevo.
-            # Esto evita repetir eternamente una pregunta por un ID roto.
-            if conversation_was_created:
-                raise
-            logger.warning("Conversation inválida/no disponible; creando una nueva", exc_info=True)
-            metadata = {"source": "manychat-sporthouse", "recovered": "true"}
+        # --------------------------------------------------------------
+        # 1) Conversación persistente (memoria de la IA)
+        # --------------------------------------------------------------
+        conversation_was_created = False
+
+        def _new_conversation(recovered: bool = False):
+            metadata = {"source": "manychat-sporthouse"}
+            if recovered:
+                metadata["recovered"] = "true"
             if data.contact_id:
                 metadata["contact_id"] = str(data.contact_id)[:512]
-            conversation = client.conversations.create(metadata=metadata)
-            conversation_id = conversation.id
+            return client.conversations.create(metadata=metadata).id
+
+        if not conversation_id:
+            conversation_id = _new_conversation()
             conversation_was_created = True
-            response = _create_response([
-                {"role": "user", "content": _external_context(data, prefetched_knowledge)}
-            ])
+
+        # --------------------------------------------------------------
+        # 2) Precarga de Knowledge solo si hay una pregunta real y la escuela se conoce.
+        # --------------------------------------------------------------
+        prefetched_knowledge = None
+        if data.school and _should_prefetch_knowledge(data.message):
+            try:
+                prefetched_knowledge = buscar_info_escuela(
+                    school=data.school,
+                    query=data.message,
+                    score_threshold=KNOWLEDGE_PREFETCH_THRESHOLD,
+                    max_results=KNOWLEDGE_PREFETCH_MAX_RESULTS,
+                )
+                if prefetched_knowledge.get("status") == "ok":
+                    knowledge_sources.extend([
+                        item.get("article_name")
+                        for item in prefetched_knowledge.get("matches") or []
+                        if item.get("article_name")
+                    ])
+            except Exception:
+                logger.warning("No se pudo precargar Knowledge; el agente podrá buscarlo como tool", exc_info=True)
+                prefetched_knowledge = None
+
+        def _create_response(input_items):
+            kwargs = dict(
+                model=OPENAI_MODEL,
+                instructions=INSTRUCTIONS,
+                conversation=conversation_id,
+                input=input_items,
+                tools=TOOLS,
+                tool_choice="auto",
+                text={"format": FINAL_RESPONSE_FORMAT},
+                max_output_tokens=OPENAI_MAX_OUTPUT_TOKENS,
+                # Si la conversación crece demasiado, se recortan los turnos viejos en vez de fallar.
+                truncation="auto",
+            )
+            use_reasoning = _MODEL_ACCEPTS_REASONING["value"] is not False and _model_maybe_reasoning()
+            if use_reasoning:
+                kwargs["reasoning"] = {"effort": OPENAI_REASONING_EFFORT}
+            try:
+                response = client.responses.create(**kwargs)
+            except openai.BadRequestError as exc:
+                if use_reasoning and "reasoning" in str(exc).lower():
+                    _MODEL_ACCEPTS_REASONING["value"] = False
+                    kwargs.pop("reasoning", None)
+                    response = client.responses.create(**kwargs)
+                else:
+                    raise
+            if use_reasoning:
+                _MODEL_ACCEPTS_REASONING["value"] = True
+            return response
+
+        first_input = [{"role": "user", "content": _external_context(data, prefetched_knowledge)}]
+        try:
+            response = _create_response(first_input)
+        except Exception as exc:
+            # Solo se crea una conversación nueva si el ID guardado es inválido/viejo.
+            # (Antes también lo hacía ante errores de crédito, duplicando el tiempo de espera.)
+            if conversation_was_created or not _is_conversation_error(exc):
+                raise
+            logger.warning("Conversation inválida/no disponible (%s); creando una nueva", conversation_id)
+            conversation_id = _new_conversation(recovered=True)
+            response = _create_response(first_input)
 
         # El modelo puede encadenar varias herramientas en el mismo turno.
         for _ in range(6):
@@ -1750,6 +1973,10 @@ async def chat(data: ChatRequest):
                 result["conversation_id"] = conversation_id
                 # Conservamos response_id solo como diagnóstico/compatibilidad. No se usa como memoria principal.
                 result["response_id"] = response.id
+                logger.info(
+                    "chat ok en %.1fs tools=%s contact=%s",
+                    time.time() - started, tools_used, data.contact_id,
+                )
                 return result
 
             tool_outputs = []
@@ -1826,15 +2053,223 @@ async def chat(data: ChatRequest):
             "knowledge_sources": list(dict.fromkeys(knowledge_sources)),
         }
 
-    except Exception:
-        logger.exception("Error en POST /chat")
+    except Exception as exc:
+        reason = _openai_failure_reason(exc)
+        if reason == "openai_sin_credito":
+            logger.error("OpenAI SIN CRÉDITO: recarga en platform.openai.com/settings/organization/billing")
+        else:
+            logger.exception("Error en chat (%s)", reason)
+        return _error_result(data, reason, conversation_id, tools_used, knowledge_sources)
+
+
+@router.get("/knowledge/search")
+def knowledge_search_debug(
+    school: str,
+    query: str,
+    x_knowledge_sync_key: Optional[str] = Header(default=None, alias="X-Knowledge-Sync-Key"),
+):
+    """Diagnóstico genérico del RAG. No lo usa ManyChat; sirve para verificar qué Knowledge recupera una consulta."""
+    if not KNOWLEDGE_SYNC_KEY or x_knowledge_sync_key != KNOWLEDGE_SYNC_KEY:
+        return {"status": "unauthorized", "message": "Sync key inválida."}
+    try:
+        result = buscar_info_escuela(school=school, query=query)
+        # Limitar texto para que Swagger sea legible, conservando título/score/fuente.
+        if result.get("status") == "ok":
+            compact = dict(result)
+            compact["matches"] = [
+                {**item, "text": (item.get("text") or "")[:1800]}
+                for item in (result.get("matches") or [])[:10]
+            ]
+            return compact
+        return result
+    except Exception as exc:
+        logger.exception("Error en GET /knowledge/search")
         return {
-            "reply": "Tuve un problema al revisar la información. Un asesor de SportHouse puede ayudarte.",
-            **_fallback_context(data),
-            "needs_human": True,
-            "escalation_reason": "backend_error",
-            "conversation_id": conversation_id,
-            "response_id": data.previous_response_id,
-            "tools_used": tools_used,
-            "knowledge_sources": list(dict.fromkeys(knowledge_sources)),
+            "status": "error",
+            "error_type": type(exc).__name__,
+            "message": str(exc),
         }
+
+
+@router.get("/knowledge/status")
+def knowledge_status():
+    if not OPENAI_API_KEY:
+        return {"status": "error", "message": "OPENAI_API_KEY no configurada"}
+    client = _openai_client()
+    vector_store_id = _get_vector_store_id(client, create_if_missing=False)
+    if not vector_store_id:
+        return {
+            "status": "not_synced",
+            "vector_store_name": OPENAI_KNOWLEDGE_VECTOR_STORE_NAME,
+            "sync_key_configured": bool(KNOWLEDGE_SYNC_KEY),
+        }
+    try:
+        store = client.vector_stores.retrieve(vector_store_id=vector_store_id)
+        counts = getattr(store, "file_counts", None)
+        if hasattr(counts, "model_dump"):
+            counts = counts.model_dump()
+        return {
+            "status": "ok",
+            "vector_store_id": vector_store_id,
+            "vector_store_name": getattr(store, "name", OPENAI_KNOWLEDGE_VECTOR_STORE_NAME),
+            "file_counts": counts,
+            "sync_key_configured": bool(KNOWLEDGE_SYNC_KEY),
+        }
+    except Exception as exc:
+        return {"status": "error", "message": str(exc)}
+
+
+@router.post("/knowledge/sync")
+def knowledge_sync(
+    background_tasks: BackgroundTasks,
+    x_knowledge_sync_key: Optional[str] = Header(default=None, alias="X-Knowledge-Sync-Key"),
+):
+    if not KNOWLEDGE_SYNC_KEY:
+        return {
+            "status": "error",
+            "message": "Configura KNOWLEDGE_SYNC_KEY en Railway antes de habilitar la sincronización.",
+        }
+    if x_knowledge_sync_key != KNOWLEDGE_SYNC_KEY:
+        return {"status": "unauthorized", "message": "Sync key inválida."}
+
+    if _KNOWLEDGE_SYNC_STATE.get("status") == "running":
+        return {
+            "status": "already_running",
+            "message": _KNOWLEDGE_SYNC_STATE.get("message"),
+            "started_at": _KNOWLEDGE_SYNC_STATE.get("started_at"),
+        }
+
+    background_tasks.add_task(_run_knowledge_sync_job)
+    return {
+        "status": "started",
+        "message": "Sincronización iniciada en segundo plano. Consulta GET /knowledge/sync/status para ver el progreso.",
+    }
+
+
+@router.get("/knowledge/sync/status")
+def knowledge_sync_status():
+    state = dict(_KNOWLEDGE_SYNC_STATE)
+    result = state.get("result")
+    # Evitamos devolver cientos de artículos en cada consulta de progreso.
+    if isinstance(result, dict):
+        state["result"] = {
+            "status": result.get("status"),
+            "vector_store_id": result.get("vector_store_id"),
+            "vector_store_name": result.get("vector_store_name"),
+            "removed_previous_files": result.get("removed_previous_files"),
+            "odoo_articles_found": result.get("odoo_articles_found"),
+            "indexed_count": result.get("indexed_count"),
+            "skipped_count": result.get("skipped_count"),
+            "skipped": result.get("skipped", [])[:20],
+        }
+    return state
+
+
+@router.post("/chat")
+def chat(data: ChatRequest):
+    """
+    Entrada síncrona del agente SportHouse (ManyChat espera la respuesta, máx. 10 s).
+
+    Es `def` y no `async def` a propósito: todo el trabajo (OpenAI, Odoo) es bloqueante y en
+    `async def` congelaba el servidor completo, así que dos mamás escribiendo a la vez se formaban.
+    """
+    with _contact_lock(data):
+        return process_chat(data)
+
+
+def _manychat_post(path: str, payload: dict):
+    response = requests.post(
+        f"{MANYCHAT_API}{path}",
+        json=payload,
+        headers={"Authorization": f"Bearer {MANYCHAT_API_KEY}", "Content-Type": "application/json"},
+        timeout=15,
+    )
+    if not response.ok or (response.headers.get("content-type", "").startswith("application/json")
+                           and response.json().get("status") == "error"):
+        raise RuntimeError(f"ManyChat {path} {response.status_code}: {response.text[:300]}")
+    return response
+
+
+def _deliver_to_manychat(data: ChatRequest, result: dict):
+    """Guarda el contexto en los campos del contacto y le manda la respuesta por WhatsApp."""
+    subscriber_id = data.contact_id
+    values = {
+        MC_FIELDS["reply"]: result.get("reply"),
+        MC_FIELDS["school"]: result.get("school"),
+        MC_FIELDS["order_number"]: result.get("order_number"),
+        MC_FIELDS["intent"]: result.get("intent"),
+        MC_FIELDS["needs_human"]: bool(result.get("needs_human")),
+        MC_FIELDS["response_id"]: result.get("response_id"),
+        MC_FIELDS["conversation_id"]: result.get("conversation_id"),
+    }
+    for field_name, value in values.items():
+        if value in (None, ""):
+            continue
+        try:
+            _manychat_post("/fb/subscriber/setCustomFieldByName", {
+                "subscriber_id": int(subscriber_id),
+                "field_name": field_name,
+                "field_value": value,
+            })
+        except Exception:
+            logger.warning("No se pudo guardar el campo %s en ManyChat", field_name, exc_info=True)
+
+    _manychat_post("/fb/sending/sendContent", {
+        "subscriber_id": int(subscriber_id),
+        "data": {
+            "version": "v2",
+            "content": {
+                "type": "whatsapp",
+                "messages": [{"type": "text", "text": result.get("reply")}],
+            },
+        },
+    })
+
+    if result.get("needs_human") and MC_HUMAN_TAG:
+        try:
+            _manychat_post("/fb/subscriber/addTagByName", {
+                "subscriber_id": int(subscriber_id),
+                "tag_name": MC_HUMAN_TAG,
+            })
+        except Exception:
+            logger.warning("No se pudo poner la etiqueta %s", MC_HUMAN_TAG, exc_info=True)
+
+
+def _run_chat_async(data: ChatRequest):
+    try:
+        with _contact_lock(data):
+            result = process_chat(data)
+            _deliver_to_manychat(data, result)
+    except Exception:
+        logger.exception("Error en chat_async para contacto %s", data.contact_id)
+
+
+@router.post("/chat_async")
+def chat_async(data: ChatRequest):
+    """
+    Modo sin límite de 10 s: responde a ManyChat al instante y, cuando la IA termina,
+    manda el mensaje directo por la API de ManyChat. Requiere contact_id y MANYCHAT_API_KEY.
+    """
+    if not data.contact_id or not str(data.contact_id).isdigit():
+        return {"status": "error", "message": "Falta contact_id válido."}
+    if not MANYCHAT_API_KEY:
+        return {"status": "error", "message": "Falta MANYCHAT_API_KEY."}
+    threading.Thread(target=_run_chat_async, args=(data,), daemon=True).start()
+    return {"status": "accepted"}
+
+
+def _knowledge_auto_sync_loop():
+    """Mantiene el índice de Knowledge al día sin que alguien tenga que correr /knowledge/sync."""
+    time.sleep(600)  # deja arrancar el servicio antes de la primera sincronización
+    while True:
+        try:
+            if OPENAI_API_KEY:
+                _run_knowledge_sync_job()
+                logger.info("Sincronización automática de Knowledge: %s", _KNOWLEDGE_SYNC_STATE.get("status"))
+        except Exception:
+            logger.exception("Falló la sincronización automática de Knowledge")
+        time.sleep(max(1.0, KNOWLEDGE_AUTO_SYNC_HOURS) * 3600)
+
+
+if KNOWLEDGE_AUTO_SYNC_HOURS > 0:
+    threading.Thread(target=_knowledge_auto_sync_loop, daemon=True, name="knowledge-auto-sync").start()
