@@ -177,7 +177,24 @@ def _norm(value: Optional[str]) -> str:
 
 _SCHOOL_STOPWORDS = {
     "de", "del", "la", "las", "el", "los", "y", "e", "campus",
+    # Todos los sitios se llaman "Sporthouse <Escuela>": la marca no distingue escuelas.
+    "sporthouse", "sport", "house",
 }
+
+# Sitios web que no son escuelas (se pueden ajustar con la variable SCHOOL_EXCLUDE, separadas por coma).
+_SCHOOL_EXCLUDE = {
+    _n.strip() for _n in os.getenv("SCHOOL_EXCLUDE", "targo,sporthouse mexico").split(",") if _n.strip()
+}
+
+# Carpetas/artículos de Knowledge que la IA nunca debe usar (contenido interno).
+_KNOWLEDGE_EXCLUDE_PREFIXES = [
+    _n.strip() for _n in os.getenv("KNOWLEDGE_EXCLUDE", "interno,manual de usuario,bienvenido").split(",") if _n.strip()
+]
+
+
+def _display_school(name: Optional[str]) -> str:
+    """'Sporthouse Monteverde' -> 'Monteverde' para hablar con las mamás."""
+    return re.sub(r"^\s*sport\s*house\s+", "", (name or "").strip(), flags=re.I) or (name or "")
 
 _SCHOOL_REGISTRY_CACHE = {"ts": 0.0, "items": []}
 _SCHOOL_REGISTRY_TTL = 300
@@ -321,6 +338,11 @@ def _school_registry(uid, models):
         {"fields": website_read_fields, "limit": 250, "order": "name asc"},
     )
 
+    websites = [
+        w for w in websites
+        if " ".join(re.findall(r"[a-z0-9]+", _norm(w.get("name")))) not in _SCHOOL_EXCLUDE
+    ]
+
     items = []
     for website in websites:
         items.append({
@@ -421,7 +443,11 @@ def _edit_distance(a: str, b: str) -> int:
 def _school_names(uid, models) -> list[str]:
     try:
         return sorted(
-            {item.get("canonical_school") for item in _school_registry(uid, models) if item.get("canonical_school")},
+            {
+                _display_school(item.get("canonical_school"))
+                for item in _school_registry(uid, models)
+                if item.get("canonical_school")
+            },
             key=_norm,
         )
     except Exception:
@@ -491,11 +517,11 @@ def _resolve_school(uid, models, school: str):
             return {
                 "status": "confirm_school",
                 "input": school,
-                "suggestion": f_item.get("canonical_school"),
+                "suggestion": _display_school(f_item.get("canonical_school")),
                 "group": f_item.get("parent_website"),
                 "score": f_best,
                 "message": (
-                    f"Probablemente quiso decir \"{f_item.get('canonical_school')}\". Pregunta UNA sola vez "
+                    f"Probablemente quiso decir \"{_display_school(f_item.get('canonical_school'))}\". Pregunta UNA sola vez "
                     "si se refiere a esa escuela. Si confirma, vuelve a llamar la herramienta con ese nombre exacto."
                 ),
             }
@@ -503,10 +529,14 @@ def _resolve_school(uid, models, school: str):
     candidates = []
     seen = set()
     for score, item in (fuzzy + scored):
-        name = item.get("canonical_school")
+        name = _display_school(item.get("canonical_school"))
         if name and name not in seen:
             seen.add(name)
-            candidates.append({"name": name, "group": item.get("parent_website"), "score": round(score, 1)})
+            candidates.append({
+                "name": name,
+                "group": _display_school(item.get("parent_website")) or None,
+                "score": round(score, 1),
+            })
     if candidates:
         return {
             "status": "ambiguous",
@@ -873,7 +903,7 @@ def _knowledge_groups(registry: list[dict]) -> list[str]:
     return groups
 
 
-def _scope_score(alias: str, article_name: str, article_text: str) -> float:
+def _scope_score(alias: str, article_name: str, article_text: str, distinctive: Optional[set] = None) -> float:
     """Puntaje genérico: prioriza el título y usa el cuerpo solo como fallback."""
     if not alias:
         return 0.0
@@ -881,11 +911,31 @@ def _scope_score(alias: str, article_name: str, article_text: str) -> float:
     alias_norm = _norm(alias)
     title_norm = _norm(article_name)
     body_norm = _norm((article_text or "")[:2500])
+    display_norm = _norm(_display_school(alias))
     if alias_norm and alias_norm in title_norm:
         score = max(score, 98.0)
+    elif display_norm and re.search(rf"\b{re.escape(display_norm)}\b", title_norm):
+        # "Compra Edron" -> Sporthouse Edron; "Horarios José Vasconcelos" -> Sporthouse José Vasconcelos.
+        score = max(score, 95.0)
     elif alias_norm and alias_norm in body_norm:
         score = max(score, 55.0)
+    # Una palabra que solo existe en el nombre de ESA escuela ("Vasconcelos", "Covadonga") basta.
+    if distinctive:
+        title_tokens = set(_school_tokens(article_name))
+        hits = [t for t in _school_tokens(alias) if t in distinctive and t in title_tokens]
+        if hits:
+            score = max(score, 88.0)
     return score
+
+
+def _distinctive_tokens(registry: list[dict]) -> set:
+    """Palabras (4+ letras) que aparecen en el nombre de una sola escuela/grupo."""
+    counts: dict = {}
+    names = {item.get("canonical_school") for item in registry} | {item.get("parent_website") for item in registry}
+    for name in names:
+        for token in set(_school_tokens(name)):
+            counts[token] = counts.get(token, 0) + 1
+    return {t for t, n in counts.items() if n == 1 and len(t) >= 4}
 
 
 def _infer_article_scope(article: dict, registry: list[dict]) -> dict:
@@ -897,12 +947,13 @@ def _infer_article_scope(article: dict, registry: list[dict]) -> dict:
     """
     groups = _knowledge_groups(registry)
     group_norms = {_norm(g) for g in groups}
+    distinctive = _distinctive_tokens(registry)
 
     best_school = (0.0, None)
     best_group = (0.0, None)
 
     for group in groups:
-        score = _scope_score(group, article.get("name") or "", article.get("text") or "")
+        score = _scope_score(group, article.get("name") or "", article.get("text") or "", distinctive)
         if score > best_group[0]:
             best_group = (score, group)
 
@@ -913,7 +964,7 @@ def _infer_article_scope(article: dict, registry: list[dict]) -> dict:
         # Un website que es padre de otras escuelas se trata como grupo, no como escuela concreta.
         if item.get("source") == "website" and _norm(name) in group_norms:
             continue
-        score = _scope_score(name, article.get("name") or "", article.get("text") or "")
+        score = _scope_score(name, article.get("name") or "", article.get("text") or "", distinctive)
         if score > best_school[0]:
             best_school = (score, name)
 
@@ -1050,6 +1101,21 @@ def _article_file_content(article: dict, scope: dict) -> str:
     )
 
 
+def _article_is_usable(article: dict, by_id: dict) -> bool:
+    """Fuera: artículos vacíos o casi vacíos (carpetas) y lo que viva en carpetas internas."""
+    text = (article.get("text") or "").strip()
+    if len(text) < 40 or _norm(text) == _norm(article.get("name")):
+        return False
+    node, seen = article, set()
+    while node and node.get("id") not in seen and len(seen) < 12:
+        seen.add(node.get("id"))
+        name = _norm(node.get("name"))
+        if any(name.startswith(_norm(prefix)) for prefix in _KNOWLEDGE_EXCLUDE_PREFIXES):
+            return False
+        node = by_id.get(node.get("parent_id"))
+    return True
+
+
 def _article_sync_sig(article: dict, scope: dict) -> str:
     """Huella de lo que se indexó: si cambia el artículo o su escuela, se vuelve a subir."""
     return f"{article.get('write_date') or ''}|{scope.get('scope_type')}|{scope.get('scope_key')}"[:500]
@@ -1131,8 +1197,8 @@ def sync_knowledge_vector_store():
     total = len(articles)
     for pos, article in enumerate(articles, start=1):
         _KNOWLEDGE_SYNC_STATE["message"] = f"Indexando artículo {pos} de {total}: {article.get('name') or article.get('id')}"
-        if not (article.get("text") or "").strip():
-            skipped.append({"id": article.get("id"), "name": article.get("name"), "reason": "empty"})
+        if not _article_is_usable(article, by_id):
+            skipped.append({"id": article.get("id"), "name": article.get("name"), "reason": "vacío o interno"})
             continue
         scope = _infer_scope_with_folders(article, by_id, registry)
         try:
@@ -1204,7 +1270,7 @@ def sync_knowledge_changes():
 
     desired = {}
     for article in articles:
-        if not (article.get("text") or "").strip():
+        if not _article_is_usable(article, by_id):
             continue
         scope = _infer_scope_with_folders(article, by_id, registry)
         desired[int(article.get("id") or 0)] = (article, scope, _article_sync_sig(article, scope))
