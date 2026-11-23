@@ -601,6 +601,14 @@ async def send_whatsapp(request: Request):
             "field_value": order_number
         }, headers=headers)
 
+        # Código de la liga de rastreo (va antes del estatus, que dispara el aviso)
+        if data.get("tracking_code"):
+            requests.post(set_field_url, json={
+                "subscriber_id": subscriber_id,
+                "field_name": "odoo_tracking_code",
+                "field_value": data.get("tracking_code")
+            }, headers=headers)
+
         requests.post(set_field_url, json={
             "subscriber_id": subscriber_id,
             "field_name": "odoo_status_sporthouse",
@@ -638,6 +646,18 @@ async def update_whatsapp_fields(request: Request):
             },
             headers=HEADERS
         )
+
+        # Código de la liga de rastreo (va antes del estatus, que dispara el aviso)
+        if data.get("tracking_code"):
+            requests.post(
+                set_field_url,
+                json={
+                    "subscriber_id": subscriber_id,
+                    "field_name": "odoo_tracking_code",
+                    "field_value": data.get("tracking_code")
+                },
+                headers=HEADERS
+            )
 
         r2 = requests.post(
             set_field_url,
