@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import unicodedata
+import uuid
 import time
 import tempfile
 import threading
@@ -924,7 +925,18 @@ def _resumen_pedido(uid, models, order, order_number, canonical_school, website_
             base = (site[0].get("domain") or None) if site else None
         except Exception:
             base = None
-    if verified_by == "phone" and order.get("access_token"):
+    token = order.get("access_token")
+    if verified_by == "phone" and not token:
+        # Igual que _portal_ensure_token de Odoo: el pedido nunca se ha abierto en el portal.
+        try:
+            token = str(uuid.uuid4())
+            models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, "sale.order", "write",
+                              [[order["id"]], {"access_token": token}])
+        except Exception as exc:
+            logger.warning("No se pudo crear la liga segura de %s: %s", order_number, exc)
+            token = None
+    if verified_by == "phone" and token:
+        order = dict(order, access_token=token)
         detail_path = f"/my/orders/{order['id']}?access_token={order['access_token']}"
     else:
         detail_path = f"/rastreo?pedido={order_number}"
