@@ -617,7 +617,46 @@ def _fields_get(uid, models, model_name: str, attributes: list[str]):
     return fields
 
 
-def consultar_pedido(school: str, order_number: str):
+def _phone10(value) -> str:
+    """Últimos 10 dígitos de un teléfono (ignora +52, 1, espacios y guiones)."""
+    if not value or _is_placeholder(value):
+        return ""
+    digits = re.sub(r"\D", "", str(value))
+    return digits[-10:] if len(digits) >= 10 else ""
+
+
+def _manychat_phone(contact_id) -> str:
+    """Teléfono de WhatsApp del contacto según ManyChat (si ManyChat no lo mandó en la petición)."""
+    if not contact_id or not MANYCHAT_API_KEY or not str(contact_id).isdigit():
+        return ""
+    try:
+        response = requests.get(
+            f"{MANYCHAT_API}/fb/subscriber/getInfo",
+            params={"subscriber_id": contact_id},
+            headers={"Authorization": f"Bearer {MANYCHAT_API_KEY}"},
+            timeout=8,
+        )
+        info = (response.json() or {}).get("data") or {}
+        return info.get("whatsapp_phone") or info.get("phone") or ""
+    except Exception as exc:
+        logger.warning("No se pudo leer el teléfono del contacto %s en ManyChat: %s", contact_id, exc)
+        return ""
+
+
+def _fmt_fecha(value) -> Optional[str]:
+    """'2026-11-20 18:00:00' -> '20/11/2026'."""
+    if not value:
+        return None
+    try:
+        return datetime.strptime(str(value)[:10], "%Y-%m-%d").strftime("%d/%m/%Y")
+    except Exception:
+        return None
+
+
+_LUGAR_ENTREGA = {"domicilio": "a domicilio", "samara": "en Samara", "colegio": "en el colegio"}
+
+
+def consultar_pedido(school: str, order_number: str, phone: Optional[str] = None):
     """
     Consulta un pedido real y valida la escuela concreta del pedido.
 
@@ -633,12 +672,6 @@ def consultar_pedido(school: str, order_number: str):
         digits = match.group(1).lstrip("0") or "0"
         order_number = "S" + digits.zfill(5)
 
-    if not school:
-        return {
-            "status": "missing_school",
-            "message": "Falta la escuela. Pregunta al cliente antes de consultar el pedido.",
-        }
-
     if not re.fullmatch(r"S\d{5,7}", order_number):
         return {
             "status": "invalid_format",
@@ -651,7 +684,8 @@ def consultar_pedido(school: str, order_number: str):
 
     # Descubrimos campos Studio que identifican escuela dentro de un grupo/sitio.
     school_field_meta = _sale_order_school_fields(uid, models)
-    order_fields = ["id", "name", "website_id"] + list(school_field_meta.keys())
+    order_fields = ["id", "name", "website_id", "partner_id", "partner_shipping_id", "state",
+                    "access_token", "commitment_date"] + list(school_field_meta.keys())
 
     orders = models.execute_kw(
         ODOO_DB, uid, ODOO_PASSWORD,
@@ -676,6 +710,38 @@ def consultar_pedido(school: str, order_number: str):
     website_name = website[1] if isinstance(website, (list, tuple)) and len(website) > 1 else ""
 
     specific_schools = _order_specific_schools(order, school_field_meta)
+
+    # Si la mamá escribe desde el mismo número que tiene el pedido, no hace falta verificar la escuela.
+    phone_verified = False
+    caller = _phone10(phone)
+    if caller:
+        partner_ids = list({
+            v[0] for v in (order.get("partner_id"), order.get("partner_shipping_id"))
+            if isinstance(v, (list, tuple)) and v
+        })
+        if partner_ids:
+            partners = models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD, "res.partner", "read",
+                [partner_ids], {"fields": ["phone"]},
+            ) or []
+            phone_verified = any(_phone10(p.get("phone")) == caller for p in partners)
+
+    if phone_verified:
+        canonical_school = (specific_schools[0].get("school") if specific_schools else None) \
+            or _display_school(website_name) or website_name or None
+        school_source_field = specific_schools[0].get("field") if specific_schools else None
+        return _resumen_pedido(uid, models, order, order_number, canonical_school,
+                               website_name, school_source_field, verified_by="phone")
+
+    if not school:
+        return {
+            "status": "missing_school",
+            "order_number": order_number,
+            "message": (
+                "El número de WhatsApp no coincide con el del pedido. Para proteger los datos, "
+                "pregunta de qué escuela es el pedido antes de revelar cualquier información."
+            ),
+        }
 
     # Primero resolvemos lo que escribió el cliente. Esto entiende siglas como IMS y
     # puede devolver canonical_school=Instituto México Secundaria, parent_website=Maristas.
@@ -751,10 +817,18 @@ def consultar_pedido(school: str, order_number: str):
             }
         school_source_field = None
 
+    return _resumen_pedido(uid, models, order, order_number, canonical_school,
+                           website_name, school_source_field, verified_by="school")
+
+
+def _resumen_pedido(uid, models, order, order_number, canonical_school, website_name,
+                    school_source_field, verified_by):
+    """Resumen claro del pedido: estado general, paquetes, fechas y liga de detalle."""
     picking_meta = _fields_get(uid, models, "stock.picking", ["type", "string", "selection"])
     status_field = "x_studio_estado_sporthouse"
     picking_fields = [
-        f for f in ("id", "name", "state", status_field, "picking_type_code", "date_done", "scheduled_date")
+        f for f in ("id", "name", "state", status_field, "picking_type_code", "date_done",
+                    "scheduled_date", "backorder_id")
         if f in picking_meta
     ]
     # sale_id liga la entrega al pedido aunque el "origen" se haya editado; origin queda como respaldo.
@@ -767,45 +841,111 @@ def consultar_pedido(school: str, order_number: str):
         ODOO_DB, uid, ODOO_PASSWORD,
         "stock.picking", "search_read",
         [picking_domain],
-        {"fields": picking_fields, "limit": 30, "order": "id desc"},
+        {"fields": picking_fields, "limit": 30, "order": "id"},
     ) or []
 
     def _status_label(row):
         # Si el campo es de selección, Odoo regresa la clave interna; usamos la etiqueta visible.
         return _field_value_label(picking_meta.get(status_field) or {}, row.get(status_field))
 
-    active = [p for p in pickings if p.get("state") != "cancel"] or pickings
-    # Antes se tomaba solo la última transferencia (podía ser una devolución o un paso interno).
-    # Prioridad: la que tiene Estado SportHouse; dentro de esas, la de salida al cliente; luego la más reciente.
-    active.sort(
-        key=lambda p: (
-            1 if _status_label(p) else 0,
-            1 if p.get("picking_type_code") == "outgoing" else 0,
-            p.get("id") or 0,
-        ),
-        reverse=True,
-    )
-    picking = active[0] if active else {}
+    # Paquetes = entregas al cliente no canceladas (una por cada envío parcial).
+    paquetes_raw = [p for p in pickings if p.get("picking_type_code") == "outgoing" and p.get("state") != "cancel"]
+    if not paquetes_raw:
+        paquetes_raw = [p for p in pickings if p.get("state") != "cancel" and _status_label(p)]
+
+    ids = [p["id"] for p in paquetes_raw]
+    productos, lugares = {}, {}
+    if ids:
+        try:
+            moves = models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD, "stock.move", "search_read",
+                [[["picking_id", "in", ids], ["state", "!=", "cancel"]]],
+                {"fields": ["picking_id", "product_id", "product_uom_qty"], "limit": 200},
+            ) or []
+            for m in moves:
+                nombre = (m.get("product_id") or [None, ""])[1]
+                nombre = re.sub(r"^\[[^\]]*\]\s*", "", nombre or "")
+                qty = m.get("product_uom_qty") or 0
+                productos.setdefault(m["picking_id"][0], []).append(
+                    f"{int(qty) if float(qty).is_integer() else qty} × {nombre}"
+                )
+        except Exception as exc:
+            logger.warning("No se pudieron leer los productos de %s: %s", order_number, exc)
+        try:
+            escaneos = models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD, "x_escaneo_salida", "search_read",
+                [[["x_picking_id", "in", ids], ["x_actividad", "in", list(_LUGAR_ENTREGA)]]],
+                {"fields": ["x_picking_id", "x_actividad"], "order": "id"},
+            ) or []
+            for e in escaneos:
+                lugares[e["x_picking_id"][0]] = _LUGAR_ENTREGA.get(e.get("x_actividad"))
+        except Exception as exc:
+            logger.warning("No se pudo leer dónde se entregó %s: %s", order_number, exc)
+
+    paquetes = []
+    for i, p in enumerate(paquetes_raw, 1):
+        entregado = p.get("state") == "done"
+        estado = _status_label(p) or ("Entregado" if entregado else "En preparación")
+        item = {
+            "paquete": i,
+            "entrega": p.get("name"),
+            "sporthouse_status": estado,
+            "entregado": entregado,
+            "productos": (productos.get(p["id"]) or [])[:8],
+        }
+        if entregado:
+            item["fecha_entrega"] = _fmt_fecha(p.get("date_done"))
+            item["lugar_entrega"] = lugares.get(p["id"])
+        else:
+            item["fecha_estimada"] = _fmt_fecha(p.get("scheduled_date"))
+        paquetes.append(item)
+
+    total = len(paquetes)
+    entregados = sum(1 for p in paquetes if p["entregado"])
+    if not total:
+        resumen = "Pedido recibido, todavía sin entregas registradas"
+    elif entregados == total:
+        resumen = "Entregado" if total == 1 else f"Entregado completo ({total} paquetes)"
+    elif entregados:
+        resumen = f"Entrega parcial · {entregados} de {total} paquetes entregados"
+    else:
+        resumen = paquetes[-1]["sporthouse_status"] if total == 1 else f"En proceso · {total} paquetes"
+
+    # Liga de detalle en la tienda del pedido. Con el número verificado va directo al detalle
+    # completo (portal); si no, a la página pública de rastreo, que no muestra datos personales.
+    website_id = (order.get("website_id") or [None])[0]
+    base = None
+    if website_id:
+        try:
+            site = models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD, "website", "read",
+                [[website_id]], {"fields": ["domain"]},
+            ) or []
+            base = (site[0].get("domain") or None) if site else None
+        except Exception:
+            base = None
+    if verified_by == "phone" and order.get("access_token"):
+        detail_path = f"/my/orders/{order['id']}?access_token={order['access_token']}"
+    else:
+        detail_path = f"/rastreo?pedido={order_number}"
 
     result = {
         "status": "ok",
+        "verified_by": verified_by,
         "order_number": order_number,
         "school": canonical_school,
         "website_group": website_name or None,
         "school_source_field": school_source_field,
-        "sporthouse_status": _status_label(picking) if picking else None,
-        "internal_delivery_state": picking.get("state") or None,
+        "resumen": resumen,
+        "paquetes": paquetes,
+        "fecha_estimada_pedido": _fmt_fecha(order.get("commitment_date")),
+        "detail_url": _absolute_website_url(base, detail_path),
+        # Compatibilidad con el formato anterior.
+        "sporthouse_status": paquetes[-1]["sporthouse_status"] if paquetes else None,
+        "internal_delivery_state": paquetes_raw[-1].get("state") if paquetes_raw else None,
     }
-    if not picking:
+    if not paquetes:
         result["note"] = "El pedido existe pero todavía no tiene entregas registradas."
-
-    # Si hay varias entregas (parciales, por ejemplo), se informan todas para no confundir al cliente.
-    labeled = [p for p in active if _status_label(p)]
-    if len(labeled) > 1:
-        result["entregas"] = [
-            {"entrega": p.get("name"), "sporthouse_status": _status_label(p)}
-            for p in labeled[:5]
-        ]
     return result
 
 
@@ -1753,8 +1893,10 @@ TOOLS = [
         "type": "function",
         "name": "consultar_pedido",
         "description": (
-            "Consulta en Odoo un pedido real. Llámala únicamente cuando conozcas la escuela "
-            "y hayas resuelto con suficiente confianza un único número de pedido en formato S00000. "
+            "Consulta en Odoo un pedido real. Llámala en cuanto hayas resuelto con suficiente confianza "
+            "un único número de pedido en formato S00000, aunque todavía no sepas la escuela: si el "
+            "WhatsApp del cliente coincide con el teléfono del pedido, se verifica solo. Si devuelve "
+            "missing_school, pregunta la escuela y vuelve a llamarla. "
             "No la llames si el cliente dio varios números, cree que le falta un dígito o existe ambigüedad: "
             "en esos casos conversa y pide aclaración primero."
         ),
@@ -1763,7 +1905,7 @@ TOOLS = [
             "properties": {
                 "school": {
                     "type": "string",
-                    "description": "Escuela confirmada por el cliente o ya conocida en el contexto.",
+                    "description": "Escuela confirmada por el cliente o ya conocida en el contexto. Cadena vacía si aún no se sabe.",
                 },
                 "order_number": {
                     "type": "string",
@@ -1908,8 +2050,9 @@ y cómo responder.
 
 ESCUELAS
 SportHouse atiende muchas escuelas y existen productos iguales o parecidos entre ellas. Para cualquier dato
-que dependa de catálogo, producto, inventario, talla, precio, guía, política, entrega, FAQ o pedido debes
-conocer primero la escuela. Nunca adivines la escuela por una prenda. Si no está clara, pregúntala de forma
+que dependa de catálogo, producto, inventario, talla, precio, guía, política, entrega o FAQ debes
+conocer primero la escuela. Excepción: para consultar un pedido con número claro llama primero consultar_pedido
+(la escuela puede ir vacía); solo pregunta la escuela si la herramienta devuelve missing_school. Nunca adivines la escuela por una prenda. Si no está clara, pregúntala de forma
 natural. Si ya está confirmada en la conversación o en CONTEXTO EXTERNO, no la vuelvas a pedir. Si el cliente
 cambia de escuela explícitamente, actualiza el contexto.
 
@@ -1942,15 +2085,27 @@ inequívoco. Ejemplos de transformación inequívoca pueden ser mayúsculas/min�
 una S omitida o un cero inicial omitido cuando el resto identifica claramente el mismo número.
 
 La regla no es memorizar ejemplos: usa criterio conversacional.
-- Si hay un único número inequívoco y conoces la escuela, llama consultar_pedido con S00000.
+- Si hay un único número inequívoco, llama consultar_pedido con S00000 (con la escuela si ya la conoces, o vacía).
+- Si devuelve missing_school, el WhatsApp no coincide con el del pedido: pregunta de qué escuela es, sin revelar nada.
 - Si hay varios números posibles, no elijas por el cliente: pregunta cuál quiere revisar.
 - Si el cliente dice o sugiere que falta/sobra un dígito, o no puedes reconstruir un único S00000 con confianza,
   no inventes: pide que lo confirme.
 - Si un número canónico no existe, pide verificarlo. No cambies dígitos para encontrar otro pedido.
 - Si consultar_pedido devuelve school_mismatch, no reveles el estado ni otros datos del pedido.
-- No necesitas validar el teléfono del cliente contra Odoo.
-- Para responder estatus usa principalmente sporthouse_status. internal_delivery_state es un dato interno y
-  no debe sustituir ni reinterpretar el Estado SportHouse ante el cliente.
+- La verificación del teléfono la hace la herramienta; nunca pidas ni menciones el teléfono del pedido.
+- Para responder estatus usa `resumen` y `paquetes` (cada paquete trae su sporthouse_status). internal_delivery_state
+  es un dato interno y no debe sustituir ni reinterpretar el Estado SportHouse ante el cliente.
+- Cuando consultar_pedido devuelva status ok, responde con este formato, breve y claro para WhatsApp:
+  📦 *Pedido S00000* · Escuela
+  *Estado:* <resumen>
+  (línea en blanco)
+  Por cada paquete: "✅ Paquete N · Entregado <lugar_entrega> el <fecha_entrega>" si entregado,
+  o "🚚 Paquete N · <sporthouse_status> · llega aprox. <fecha_estimada>" si no; debajo, en una línea, sus productos
+  separados por coma (si son muchos, los 3 primeros y "y N más"). Si solo hay un paquete, no digas "Paquete 1".
+  Omite lugar o fecha si vienen vacíos; nunca inventes fechas.
+  (línea en blanco)
+  "Ver detalle de mi pedido: <detail_url>" (copia la liga exacta, completa, sin formato markdown).
+  Cierra con una sola frase corta ofreciendo ayuda. No agregues datos que no vengan en la herramienta.
 
 FLUJO UNIVERSAL DE CONOCIMIENTO
 Este criterio aplica a TODAS las preguntas de SportHouse, no a una lista cerrada de temas.
@@ -2319,9 +2474,13 @@ def process_chat(data: ChatRequest) -> dict:
 
                 try:
                     if call.name == "consultar_pedido":
+                        caller_phone = data.phone if (data.phone and not _is_placeholder(data.phone)) else None
+                        if not caller_phone:
+                            caller_phone = _manychat_phone(data.contact_id)
                         tool_result = consultar_pedido(
                             school=args.get("school"),
                             order_number=args.get("order_number"),
+                            phone=caller_phone,
                         )
 
                     elif call.name == "buscar_info_escuela":
