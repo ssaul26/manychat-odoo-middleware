@@ -3,7 +3,7 @@ import xmlrpc.client
 import os
 from collections import defaultdict, OrderedDict
 from datetime import datetime
-import unicodedata, time, re
+import unicodedata, time, re, threading
 import logging
 import requests
 from chatgpt_odoo_api import chatgpt_app
@@ -623,58 +623,90 @@ async def send_whatsapp(request: Request):
     except Exception as e:
         return {"error": str(e)}
 
+# ManyChat no vuelve a disparar la misma regla para un contacto si el campo cambia
+# antes de 30 s (https://support.manychat.com: "once in 30 seconds"). Cuando se escanean
+# dos paquetes seguidos, el segundo aviso se perdía. Por eso los avisos se encolan por
+# contacto: se juntan las ráfagas (varios cambios en 1-2 s => se manda el último estatus
+# de cada pedido) y entre un aviso y otro al mismo contacto pasan al menos 35 s.
+_WA_BURST_SECONDS = 4
+_WA_GAP_SECONDS = 35
+_wa_lock = threading.Lock()
+_wa_pending = {}      # subscriber_id -> OrderedDict(order_number -> payload)
+_wa_last_sent = {}    # subscriber_id -> time.time() del último estatus aplicado
+_wa_workers = set()   # contactos con un hilo trabajando su cola
+
+
+def _apply_whatsapp_fields(data: dict):
+    set_field_url = "https://api.manychat.com/fb/subscriber/setCustomFieldByName"
+    subscriber_id = data.get("subscriber_id")
+
+    r1 = requests.post(set_field_url, json={
+        "subscriber_id": subscriber_id,
+        "field_name": "odoo_order_number",
+        "field_value": data.get("order_number"),
+    }, headers=HEADERS, timeout=15)
+
+    # Código de la liga de rastreo (va antes del estatus, que dispara el aviso)
+    if data.get("tracking_code"):
+        requests.post(set_field_url, json={
+            "subscriber_id": subscriber_id,
+            "field_name": "odoo_tracking_code",
+            "field_value": data.get("tracking_code"),
+        }, headers=HEADERS, timeout=15)
+
+    r2 = requests.post(set_field_url, json={
+        "subscriber_id": subscriber_id,
+        "field_name": "odoo_status_sporthouse",
+        "field_value": data.get("status"),
+    }, headers=HEADERS, timeout=15)
+    logging.info("Aviso %s %s -> %s (%s/%s)", subscriber_id, data.get("order_number"),
+                 data.get("status"), r1.status_code, r2.status_code)
+    return r1, r2
+
+
+def _wa_worker(subscriber_id):
+    while True:
+        time.sleep(_WA_BURST_SECONDS)
+        with _wa_lock:
+            wait = _wa_last_sent.get(subscriber_id, 0) + _WA_GAP_SECONDS - time.time()
+        if wait > 0:
+            time.sleep(wait)
+        with _wa_lock:
+            queue = _wa_pending.get(subscriber_id)
+            if not queue:
+                _wa_pending.pop(subscriber_id, None)
+                _wa_workers.discard(subscriber_id)
+                return
+            _, data = queue.popitem(last=False)
+            _wa_last_sent[subscriber_id] = time.time()
+        try:
+            _apply_whatsapp_fields(data)
+        except Exception:
+            logging.exception("No se pudo mandar el aviso a %s", subscriber_id)
+
+
 @app.post("/update_whatsapp_fields")
 async def update_whatsapp_fields(request: Request):
     try:
         data = await request.json()
-
         subscriber_id = data.get("subscriber_id")
-        order_number = data.get("order_number")
-        status = data.get("status")
-
         if not subscriber_id:
             return {"error": "Falta subscriber_id"}
 
-        set_field_url = "https://api.manychat.com/fb/subscriber/setCustomFieldByName"
+        key = str(subscriber_id)
+        with _wa_lock:
+            queue = _wa_pending.setdefault(key, OrderedDict())
+            order_key = data.get("order_number") or ""
+            queue.pop(order_key, None)   # el estatus más reciente de cada pedido reemplaza al anterior
+            queue[order_key] = data
+            start_worker = key not in _wa_workers
+            if start_worker:
+                _wa_workers.add(key)
+            position = len(queue)
+        if start_worker:
+            threading.Thread(target=_wa_worker, args=(key,), daemon=True).start()
 
-        r1 = requests.post(
-            set_field_url,
-            json={
-                "subscriber_id": subscriber_id,
-                "field_name": "odoo_order_number",
-                "field_value": order_number
-            },
-            headers=HEADERS
-        )
-
-        # Código de la liga de rastreo (va antes del estatus, que dispara el aviso)
-        if data.get("tracking_code"):
-            requests.post(
-                set_field_url,
-                json={
-                    "subscriber_id": subscriber_id,
-                    "field_name": "odoo_tracking_code",
-                    "field_value": data.get("tracking_code")
-                },
-                headers=HEADERS
-            )
-
-        r2 = requests.post(
-            set_field_url,
-            json={
-                "subscriber_id": subscriber_id,
-                "field_name": "odoo_status_sporthouse",
-                "field_value": status
-            },
-            headers=HEADERS
-        )
-
-        return {
-            "order_update_status": r1.status_code,
-            "order_update_response": r1.text,
-            "status_update_status": r2.status_code,
-            "status_update_response": r2.text
-        }
+        return {"status": "queued", "subscriber_id": subscriber_id, "position": position}
 
     except Exception as e:
         return {"error": str(e)}
